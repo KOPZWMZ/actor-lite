@@ -1,6 +1,7 @@
-use crate::{ActorContext, ActorHandle, core::ActorCore};
+use crate::{ActorContext, ActorHandle, CancelToken, core::ActorCore};
 
-use tracing::trace;
+use tokio::sync::broadcast;
+use tracing::{trace, warn};
 /// actor 的**异步壳**。
 ///
 /// 在 [`ActorCore`] 之上增加两件事：`run` 的签名（返回 future）和 [`spawn`](AsyncActor::spawn)。
@@ -120,4 +121,114 @@ pub trait AsyncActor: ActorCore + Send + 'static {
     /// }
     /// ```
     fn run(self, context: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static;
+}
+impl<A: ActorCore> ActorHandle<A> {
+    /// 异步监听状态变化。
+    ///
+    /// 每次状态变化时会调用 `op`，传入最新状态；返回的 [`CancelToken`] 调用
+    /// [`CancelToken::cancel`] 后停止监听。
+    ///
+    /// # 注意
+    ///
+    /// 内部使用 `tokio::spawn`，**调用线程必须有 tokio runtime**，否则会 panic
+    /// （`there is no reactor running`）。同步宿主（GUI 回调、GTK/iOS 主线程等）请改用
+    /// `watch::Receiver` 的方式自己拉：`get_state()` 轮询，或基于
+    /// `get_events_rx()` 每帧 `try_recv()`。
+    pub fn state_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
+    where
+        F: FnMut(A::State) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let token = CancelToken::new();
+        let wait_token = token.clone();
+        let mut rx = self.state_rx.clone();
+        let listen = async move {
+            loop {
+                tokio::select! {
+                _ = wait_token.cancelled() => break,
+                result = rx.changed() => {
+                    match result {
+                    Ok(())=>{
+                        let state = rx.borrow_and_update().to_owned();
+                         op(state).await;
+                        }
+
+                    Err(_) => break}
+                }
+                }
+            }
+        };
+        tokio::spawn(listen);
+        token
+    }
+    /// 异步监听进度变化。
+    ///
+    /// 每次进度变化时调用 `op`。进度是 `watch` 语义，**中间值可能被跳过**，
+    /// 只保证拿到的是当时的最新值；返回的 [`CancelToken`] 调用 `cancel()` 后停止监听。
+    ///
+    /// # 注意
+    ///
+    /// 与 [`ActorHandle::state_listen_async`] 相同：内部 `tokio::spawn`，需要 tokio runtime。
+    pub fn progress_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
+    where
+        F: FnMut(A::Progress) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let token = CancelToken::new();
+        let wait_token = token.clone();
+        let mut rx = self.progress_rx.clone();
+        let listen = async move {
+            loop {
+                tokio::select! {
+                    _ = wait_token.cancelled() => break,
+                    result = rx.changed() => {
+                        match result {
+                        Ok(())=>{
+                            let progress = rx.borrow_and_update().to_owned();
+                            op(progress).await;
+                        }
+                        Err(_) => break}
+                    }
+                }
+            }
+        };
+        tokio::spawn(listen);
+        token
+    }
+    /// 异步监听事件流。
+    ///
+    /// 每收到一个事件调用一次 `op`。落后超过事件通道容量时会收到 `Lagged`，
+    /// 内部只记一条 warn 然后继续（**丢事件**，不重放）；返回的 [`CancelToken`]
+    /// 调用 `cancel()` 后停止监听。
+    ///
+    /// # 注意
+    ///
+    /// 与 [`ActorHandle::state_listen_async`] 相同：内部 `tokio::spawn`，需要 tokio runtime。
+    pub fn events_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
+    where
+        F: FnMut(A::Event) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let mut rx = self.event_tx.subscribe();
+        let token = CancelToken::new();
+        let wait_token = token.clone();
+        let listen = async move {
+            loop {
+                tokio::select! {
+                    _ = wait_token.cancelled() => break,
+                    result = rx.recv() => {
+                        match result {
+                            Ok(e) => { op(e).await; }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("事件监听落后 {n} 条");
+                                continue;
+                        }
+                    }}
+                }
+            }
+        };
+        tokio::spawn(listen);
+        token
+    }
 }

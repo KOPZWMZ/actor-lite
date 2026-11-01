@@ -64,7 +64,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// 子 actor 管理器。
 ///
@@ -79,7 +79,6 @@ use tracing::debug;
 /// # 类型参数
 ///
 /// - `A`: 子 actor 的类型，必须实现 [`AsyncActor`]。
-/// - `C`: 预留的命令通道容量参数（命令通道已改为无界，当前未使用）。
 /// - `E`: 管理器事件通道（`broadcast`）的容量。
 ///
 /// # 示例
@@ -111,7 +110,7 @@ use tracing::debug;
 
 /// # }
 /// ```
-pub struct ActorManager<A: AsyncActor, const C: usize = 32, const E: usize = 256> {
+pub struct ActorManager<A: AsyncActor, const E: usize = 256> {
     actors: HashMap<usize, ActorHandle<A>>,
     next_id: AtomicUsize,
     state: ManagerState<A::State>,
@@ -257,8 +256,13 @@ impl<A: AsyncActor, const E: usize> AsyncActor for ActorManager<A, E> {
                                 let _ = context.send_event(ManagerEvent::Stopped { id });
                             }
                             ManagerCmd::Forward { id, cmd } => {
-                                if let Some(handle) = manager.actors.get(&id) {
-                                    let _ =handle.send_cmd(cmd);
+                                match manager.actors.get(&id) {
+                                    Some(handle) => {
+                                        if handle.send_cmd(cmd).is_err() {
+                                            warn!("子Actor已经停止了: id={id}");
+                                        }
+                                    }
+                                    None => warn!("没有找到id对应的子Actor: id={id}"),
                                 }
                             }
                         }
