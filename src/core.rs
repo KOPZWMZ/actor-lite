@@ -1,7 +1,10 @@
 use core::fmt;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
+
+use crate::wait::{self, CmdWait, SharedWaker};
 /// Actor 的**数据面** trait。
 ///
 /// `ActorCore` 只定义 actor「有什么」，不定义「怎么跑」。每个 actor 有四个关联类型：
@@ -117,16 +120,17 @@ pub trait ActorCore: Sized {
         let (state_tx, state_rx) = watch::channel(init_state);
         let (event_tx, _) = broadcast::channel(Self::EVENT_CAPACITY);
         let (progress_tx, progress_rx) = watch::channel(init_progress);
-        let cancel = CancelToken::new();
 
+        let waker = SharedWaker::default();
+        let cancel = CancelToken::with_waker(waker.clone());
         let context_cancel = cancel.clone();
-
         let context = ActorContext {
             cmd_rx,
             event_tx: event_tx.clone(),
             state_tx,
             progress_tx,
             cancel: context_cancel,
+            waker: waker.clone(),
         };
         let handle = ActorHandle {
             cmd_tx,
@@ -134,6 +138,7 @@ pub trait ActorCore: Sized {
             state_rx,
             progress_rx,
             cancel,
+            waker,
         };
         (context, handle)
     }
@@ -193,6 +198,7 @@ pub struct ActorHandle<A: ActorCore> {
     pub(crate) event_tx: broadcast::Sender<A::Event>,
     pub(crate) progress_rx: watch::Receiver<A::Progress>,
     cancel: CancelToken,
+    waker: SharedWaker,
 }
 
 impl<A: ActorCore> ActorHandle<A> {
@@ -208,7 +214,9 @@ impl<A: ActorCore> ActorHandle<A> {
         self.cmd_tx.send(cmd).map_err(|_| {
             warn!("send cmd failed: channel closed");
             SendCmdError::Stopped
-        })
+        })?;
+        self.waker.wake();
+        Ok(())
     }
     /// 获取 actor 的最新状态。
     pub fn get_state(&self) -> A::State {
@@ -239,6 +247,10 @@ impl<A: ActorCore> ActorHandle<A> {
     pub fn stop(&self) {
         self.cancel.cancel();
     }
+    /// 主动唤醒 actor 线程（异步壳上是 no-op）。
+    pub fn wake(&self) {
+        self.waker.wake();
+    }
 }
 impl<A: ActorCore> Clone for ActorHandle<A> {
     fn clone(&self) -> Self {
@@ -248,6 +260,7 @@ impl<A: ActorCore> Clone for ActorHandle<A> {
             event_tx: self.event_tx.clone(),
             progress_rx: self.progress_rx.clone(),
             cancel: self.cancel.clone(),
+            waker: self.waker.clone(),
         }
     }
 }
@@ -275,6 +288,7 @@ pub struct ActorContext<A: ActorCore> {
     event_tx: broadcast::Sender<A::Event>,
     progress_tx: watch::Sender<A::Progress>,
     cancel: CancelToken,
+    waker: SharedWaker,
 }
 impl<A: ActorCore> ActorContext<A> {
     /// 获取额外的事件发送端。
@@ -320,6 +334,38 @@ impl<A: ActorCore> ActorContext<A> {
     pub fn cancel_clone(&self) -> CancelToken {
         self.cancel.clone()
     }
+    /// actor 是否已被要求停止。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+    /// 阻塞等待下一条命令，最多等 `dur`。会把当前线程 park 住。
+    ///
+    /// 有命令 → `Ok(cmd)`；`dur` 内无命令 → `Err(CmdWait::Timeout)`；
+    /// 已停止/通道关闭 → `Err(CmdWait::Closed)`。会被 `send_cmd`/`stop`/`wake` 提前唤醒。
+    /// 传 `Duration::MAX` 等价于无限等待。
+    pub fn recv_cmd_timeout(&mut self, dur: Duration) -> Result<A::Cmd, CmdWait> {
+        if self.cancel.is_cancelled() {
+            return Err(CmdWait::Closed);
+        }
+        let waker = self.waker.waker();
+        let deadline = Instant::now().checked_add(dur); // Duration::MAX 不溢出
+        match wait::drive_until(self.cmd_rx.recv(), deadline, &waker) {
+            Some(Some(cmd)) => Ok(cmd),
+            Some(None) => Err(CmdWait::Closed),
+            None => Err(CmdWait::Timeout),
+        }
+    }
+    /// 一直阻塞到有命令、或 actor 被停止。
+    pub fn recv_cmd(&mut self) -> Option<A::Cmd> {
+        if self.cancel.is_cancelled() {
+            return None;
+        }
+        let waker = self.waker.waker();
+        match wait::drive_until(self.cmd_rx.recv(), None, &waker) {
+            Some(cmd) => cmd,
+            None => unreachable!("无 deadline 不会超时"),
+        }
+    }
 }
 /// 取消信号。
 ///
@@ -334,6 +380,7 @@ impl<A: ActorCore> ActorContext<A> {
 #[derive(Clone, Debug)]
 pub struct CancelToken {
     tx: watch::Sender<bool>,
+    waker: SharedWaker,
 }
 impl Default for CancelToken {
     fn default() -> Self {
@@ -343,10 +390,16 @@ impl Default for CancelToken {
 impl CancelToken {
     /// 创建一个未取消的信号。
     pub fn new() -> Self {
-        let (tx, _rx) = watch::channel(false);
-        Self { tx }
+        let tx = watch::channel(false).0;
+        let waker = SharedWaker::default();
+        Self { tx, waker }
     }
-
+    pub(crate) fn with_waker(waker: SharedWaker) -> Self {
+        Self {
+            tx: watch::channel(false).0,
+            waker,
+        }
+    }
     /// 检查取消信号。
     pub fn is_cancelled(&self) -> bool {
         *self.tx.borrow()
@@ -363,6 +416,15 @@ impl CancelToken {
     /// 信号不会"过期"，之后再调用 `cancelled()` 也会立即返回。
     pub fn cancel(&self) {
         self.tx.send_replace(true);
+        self.waker.wake();
+    }
+    /// 阻塞等待取消（线程 actor 用；异步壳请用 `cancelled()`）。
+    pub fn cancelled_blocking(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let waker = self.waker.waker();
+        let _ = wait::drive_until(self.cancelled(), None, &waker);
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
