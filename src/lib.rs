@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
-mod actor;
+mod async_actor;
+mod core;
 pub mod manager;
-pub use actor::{Actor, ActorContext, ActorHandle, CancelToken};
+pub use async_actor::AsyncActor;
+pub use core::{ActorContext, ActorCore, ActorHandle, CancelToken};

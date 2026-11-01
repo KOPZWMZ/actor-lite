@@ -1,12 +1,12 @@
 //! Actor 管理器模块。
 //!
-//! [`ActorManager`] 是一个特殊的 [`Actor`]，它管理一组同类型的子 actor，
+//! [`ActorManager`] 是一个特殊的 [`AsyncActor`]，它管理一组同类型的子 actor，
 //! 并聚合它们的状态、进度和事件，对外暴露为单一 actor 接口。
 //!
 //! # 架构
 //!
 //! ```text
-//! ActorManager (本身也是 Actor)
+//! ActorManager (本身也是 AsyncActor)
 //! ├── Child Actor 0  (id=1)
 //! ├── Child Actor 1  (id=2)
 //! └── Child Actor 2  (id=3)
@@ -16,18 +16,25 @@
 //! - 管理器自动监听子 actor 的状态、进度和事件，并聚合到自身的 [`ManagerState`] 和 [`ManagerProgress`] 中。
 //! - 外部通过 [`ManagerCmd`] 向管理器发送命令：启动/停止子 actor，或转发命令给某个子 actor。
 //!
+//! # 限制
+//!
+//! manager 及其子 actor 目前都要求异步壳（[`AsyncActor`]）：子 actor 走 `tokio::spawn`，
+//! 聚合用的 `tokio::time::interval` 也依赖 runtime。因此整个 manager 必须跑在 tokio runtime 里。
+//!
 //! # 示例
 //!
 //! ```no_run
-//! # use actor_lite::{Actor, ActorContext, ActorHandle};
+//! # use actor_lite::{ActorCore, AsyncActor, ActorContext, ActorHandle};
 //! # use actor_lite::manager::{ActorManager, ManagerCmd, ManagerState, ManagerProgress, ManagerEvent};
 //! # struct MyActor;
-//! # impl Actor for MyActor {
+//! # impl ActorCore for MyActor {
 //! #     type Cmd = ();
 //! #     type Event = ();
 //! #     type State = ();
 //! #     type Progress = ();
 //! #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), ()) }
+//! # }
+//! # impl AsyncActor for MyActor {
 //! #     fn run(self, context: ActorContext<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
 //! #         async {}
 //! #     }
@@ -38,21 +45,21 @@
 //! let handle = manager.spawn();
 //!
 //! let (id_tx,id_rx) = tokio::sync::oneshot::channel();
-//! handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+//! handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).unwrap();
 //! let id = id_rx.await.unwrap();
 //! // 读取所有子 actor 的状态
 //! let state: ManagerState<()> = handle.get_state();
 //! assert_eq!(state.len(), 1);
 //!
 //! // 向指定子 actor 转发命令
-//! handle.send_cmd(ManagerCmd::Forward { id: 1, cmd: () }).await.unwrap();
+//! handle.send_cmd(ManagerCmd::Forward { id: 1, cmd: () }).unwrap();
 //!
 //! // 停止指定子 actor
-//! handle.send_cmd(ManagerCmd::StopActor(1)).await.unwrap();
+//! handle.send_cmd(ManagerCmd::StopActor(1)).unwrap();
 //! # }
 //! ```
-
-use crate::actor::{Actor, ActorContext, ActorHandle, CancelToken};
+use crate::async_actor::AsyncActor;
+use crate::core::{ActorContext, ActorCore, ActorHandle, CancelToken};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -61,7 +68,8 @@ use tracing::debug;
 
 /// 子 actor 管理器。
 ///
-/// `ActorManager` 本身实现了 [`Actor`] trait，因此可以像普通 actor 一样被 `spawn` 和持有。
+/// `ActorManager` 本身实现了 [`AsyncActor`]，因此可以像普通 actor 一样被 [`AsyncActor::spawn`]
+/// 启动和持有。
 ///
 /// 它管理一组同类型的子 actor，对外提供：
 /// - 启动/停止子 actor
@@ -70,20 +78,24 @@ use tracing::debug;
 ///
 /// # 类型参数
 ///
-/// - `A`: 子 actor 的类型，必须实现 [`Actor`] trait。
+/// - `A`: 子 actor 的类型，必须实现 [`AsyncActor`]。
+/// - `C`: 预留的命令通道容量参数（命令通道已改为无界，当前未使用）。
+/// - `E`: 管理器事件通道（`broadcast`）的容量。
 ///
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::{ActorCore, AsyncActor, ActorContext};
 /// # use actor_lite::manager::{ActorManager, ManagerCmd};
 /// # struct MyActor;
-/// # impl Actor for MyActor {
+/// # impl ActorCore for MyActor {
 /// #     type Cmd = ();
 /// #     type Event = ();
 /// #     type State = ();
 /// #     type Progress = ();
 /// #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), ()) }
+/// # }
+/// # impl AsyncActor for MyActor {
 /// #     fn run(self, context: ActorContext<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
 /// #         async {}
 /// #     }
@@ -94,12 +106,12 @@ use tracing::debug;
 ///
 /// // 启动子 actor，返回分配的 id
 /// let (id_tx,id_rx) = tokio::sync::oneshot::channel();
-/// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+/// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).unwrap();
 /// let id = id_rx.await.unwrap();
 
 /// # }
 /// ```
-pub struct ActorManager<A: Actor, const C: usize = 32, const E: usize = 256> {
+pub struct ActorManager<A: AsyncActor, const C: usize = 32, const E: usize = 256> {
     actors: HashMap<usize, ActorHandle<A>>,
     next_id: AtomicUsize,
     state: ManagerState<A::State>,
@@ -108,7 +120,7 @@ pub struct ActorManager<A: Actor, const C: usize = 32, const E: usize = 256> {
     update_interval: Duration,
 }
 
-impl<A: Actor, const C: usize, const E: usize> ActorManager<A, C, E> {
+impl<A: AsyncActor, const E: usize> ActorManager<A, E> {
     /// 创建一个空的 `ActorManager`。
     ///
     /// 初始时不管理任何子 actor，需要启动后通过 [`ManagerCmd::SpawnActor`] 添加。
@@ -205,18 +217,18 @@ impl<A: Actor, const C: usize, const E: usize> ActorManager<A, C, E> {
     }
 }
 
-impl<A: Actor, const C: usize, const E: usize> Actor for ActorManager<A, C, E> {
+impl<A: AsyncActor, const E: usize> ActorCore for ActorManager<A, E> {
     type Cmd = ManagerCmd<A>;
     type State = ManagerState<A::State>;
     type Progress = ManagerProgress<A::Progress>;
     type Event = ManagerEvent<A::Event>;
-    const CMD_CAPACITY: usize = C;
     const EVENT_CAPACITY: usize = E;
 
     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) {
         (self.state.clone(), self.progress.clone())
     }
-
+}
+impl<A: AsyncActor, const E: usize> AsyncActor for ActorManager<A, E> {
     fn run(self, context: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static {
         let mut context = context;
         let mut manager = self;
@@ -246,7 +258,7 @@ impl<A: Actor, const C: usize, const E: usize> Actor for ActorManager<A, C, E> {
                             }
                             ManagerCmd::Forward { id, cmd } => {
                                 if let Some(handle) = manager.actors.get(&id) {
-                                    let _ =handle.send_cmd(cmd).await;
+                                    let _ =handle.send_cmd(cmd);
                                 }
                             }
                         }
@@ -311,15 +323,17 @@ impl CancelListeners {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::{ActorCore, AsyncActor, ActorContext};
 /// # use actor_lite::manager::{ActorManager, ManagerCmd};
 /// # struct MyActor;
-/// # impl Actor for MyActor {
+/// # impl ActorCore for MyActor {
 /// #     type Cmd = String;
 /// #     type Event = ();
 /// #     type State = ();
 /// #     type Progress = ();
 /// #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), ()) }
+/// # }
+/// # impl AsyncActor for MyActor {
 /// #     fn run(self, context: ActorContext<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
 /// #         async {}
 /// #     }
@@ -329,17 +343,17 @@ impl CancelListeners {
 ///
 /// // 启动子 actor
 /// let (id_tx,id_rx) = tokio::sync::oneshot::channel();
-/// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).await.unwrap();
+/// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).unwrap();
 /// let id = id_rx.await.unwrap();
 /// // 转发命令给 id=1 的子 actor
-/// handle.send_cmd(ManagerCmd::Forward { id: 1, cmd: "hello".into() }).await.unwrap();
+/// handle.send_cmd(ManagerCmd::Forward { id: 1, cmd: "hello".into() }).unwrap();
 ///
 /// // 停止 id=1 的子 actor
-/// handle.send_cmd(ManagerCmd::StopActor(1)).await.unwrap();
+/// handle.send_cmd(ManagerCmd::StopActor(1)).unwrap();
 /// # }
 /// ```
 
-pub enum ManagerCmd<A: Actor> {
+pub enum ManagerCmd<A: AsyncActor> {
     /// 启动一个新的子 actor。
     ///
     /// 管理器会为其分配唯一 `id`，并通过 [`ManagerEvent::Spawned`] 事件通知。
@@ -365,15 +379,17 @@ pub enum ManagerCmd<A: Actor> {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::{ActorCore, AsyncActor, ActorContext};
 /// # use actor_lite::manager::{ActorManager, ManagerState};
 /// # struct MyActor;
-/// # impl Actor for MyActor {
+/// # impl ActorCore for MyActor {
 /// #     type Cmd = ();
 /// #     type Event = ();
 /// #     type State = u32;
 /// #     type Progress = ();
 /// #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { (0, ()) }
+/// # }
+/// # impl AsyncActor for MyActor {
 /// #     fn run(self, context: ActorContext<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
 /// #         async {}
 /// #     }
@@ -430,15 +446,17 @@ impl<State> ManagerState<State> {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::{ActorCore, AsyncActor, ActorContext};
 /// # use actor_lite::manager::{ActorManager, ManagerProgress};
 /// # struct MyActor;
-/// # impl Actor for MyActor {
+/// # impl ActorCore for MyActor {
 /// #     type Cmd = ();
 /// #     type Event = ();
 /// #     type State = ();
 /// #     type Progress = f32;
 /// #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), 0.0) }
+/// # }
+/// # impl AsyncActor for MyActor {
 /// #     fn run(self, context: ActorContext<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
 /// #         async {}
 /// #     }
@@ -495,15 +513,17 @@ impl<Progress> ManagerProgress<Progress> {
 /// # 示例
 ///
 /// ```no_run
-/// # use actor_lite::{Actor, ActorContext};
+/// # use actor_lite::{ActorCore, AsyncActor, ActorContext};
 /// # use actor_lite::manager::{ActorManager, ManagerEvent};
 /// # struct MyActor;
-/// # impl Actor for MyActor {
+/// # impl ActorCore for MyActor {
 /// #     type Cmd = ();
 /// #     type Event = String;
 /// #     type State = ();
 /// #     type Progress = ();
 /// #     fn init_state_and_progress(&self) -> (Self::State, Self::Progress) { ((), ()) }
+/// # }
+/// # impl AsyncActor for MyActor {
 /// #     fn run(self, context: ActorContext<Self>) -> impl std::future::Future<Output = ()> + Send + 'static {
 /// #         async {}
 /// #     }

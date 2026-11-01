@@ -7,5 +7,19 @@ license = "MIT"
 readme = "README.md"
 repository = "https://github.com/KOPZWMZ/actor_kit.git"
 [dependencies]
-tokio = { version = "1.53.1", features = ["macros", "sync", "rt", "time"] }
-tracing = "0.1.44"
+# 默认关掉全部 feature，只留 sync（纯数据结构，不需要 runtime）
+tokio = { version = "1.53.1", default-features = false, features = ["sync"] }
+tracing = "0.1"
+
+[features]
+default = ["async", "manager"]
+async = ["tokio/rt", "tokio/time", "tokio/macros"] # tokio::spawn + 监听器
+manager = ["async"]                                # manager 依赖 time + spawn
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "sync",
+] }
