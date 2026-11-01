@@ -4,12 +4,15 @@
 mod async_actor;
 
 mod core;
-mod wait;
 
 #[cfg(feature = "manager")]
 pub mod manager;
+
+mod thread_actor;
+mod wait;
+
 #[cfg(feature = "async")]
 pub use async_actor::AsyncActor;
 
 pub use core::{ActorContext, ActorCore, ActorHandle, CancelToken, SendCmdError};
-pub use wait::CmdWait;
+pub use thread_actor::{CmdWait, ThreadActor, spawn_thread};

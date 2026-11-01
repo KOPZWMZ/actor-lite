@@ -107,7 +107,7 @@ use tracing::{debug, warn};
 /// let (id_tx,id_rx) = tokio::sync::oneshot::channel();
 /// handle.send_cmd(ManagerCmd::SpawnActor{actor:MyActor,id_tx:Some(id_tx)}).unwrap();
 /// let id = id_rx.await.unwrap();
-
+///
 /// # }
 /// ```
 pub struct ActorManager<A: AsyncActor, const E: usize = 256> {
@@ -117,6 +117,12 @@ pub struct ActorManager<A: AsyncActor, const E: usize = 256> {
     progress: ManagerProgress<A::Progress>,
     listeners: HashMap<usize, CancelListeners>,
     update_interval: Duration,
+}
+
+impl<A: AsyncActor, const E: usize> Default for ActorManager<A, E> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<A: AsyncActor, const E: usize> ActorManager<A, E> {
@@ -247,13 +253,13 @@ impl<A: AsyncActor, const E: usize> AsyncActor for ActorManager<A, E> {
                                 if let Some(tx) = id_tx{
                                     let _ = tx.send(id);
                                 }
-                                let _ = context.send_event(ManagerEvent::Spawned { id });
+                                context.send_event(ManagerEvent::Spawned { id });
                             }
                             ManagerCmd::StopActor(id) => {
                                 manager.stop_actor(id);
                                 context.update_state(manager.state.clone());
                                 context.update_progress(manager.progress.clone());
-                                let _ = context.send_event(ManagerEvent::Stopped { id });
+                                context.send_event(ManagerEvent::Stopped { id });
                             }
                             ManagerCmd::Forward { id, cmd } => {
                                 match manager.actors.get(&id) {
@@ -356,7 +362,6 @@ impl CancelListeners {
 /// handle.send_cmd(ManagerCmd::StopActor(1)).unwrap();
 /// # }
 /// ```
-
 pub enum ManagerCmd<A: AsyncActor> {
     /// 启动一个新的子 actor。
     ///

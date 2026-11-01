@@ -1,6 +1,6 @@
 [package]
 name = "actor-lite"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2024"
 description = "基于 tokio 的轻量 actor 抽象，提供命令通道、状态/进度广播和事件通知"
 license = "MIT"

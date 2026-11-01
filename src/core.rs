@@ -1,10 +1,10 @@
 use core::fmt;
-use std::time::{Duration, Instant};
-
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
 
-use crate::wait::{self, CmdWait, SharedWaker};
+use crate::wait::{self, SharedWaker};
 /// Actor 的**数据面** trait。
 ///
 /// `ActorCore` 只定义 actor「有什么」，不定义「怎么跑」。每个 actor 有四个关联类型：
@@ -124,6 +124,7 @@ pub trait ActorCore: Sized {
         let waker = SharedWaker::default();
         let cancel = CancelToken::with_waker(waker.clone());
         let context_cancel = cancel.clone();
+        let alive = Arc::new(AtomicBool::new(true));
         let context = ActorContext {
             cmd_rx,
             event_tx: event_tx.clone(),
@@ -131,6 +132,7 @@ pub trait ActorCore: Sized {
             progress_tx,
             cancel: context_cancel,
             waker: waker.clone(),
+            _alive: AliveGuard(alive.clone()),
         };
         let handle = ActorHandle {
             cmd_tx,
@@ -139,6 +141,7 @@ pub trait ActorCore: Sized {
             progress_rx,
             cancel,
             waker,
+            alive,
         };
         (context, handle)
     }
@@ -191,14 +194,14 @@ pub trait ActorCore: Sized {
 /// listener.cancel();
 /// # }
 /// ```
-
 pub struct ActorHandle<A: ActorCore> {
     cmd_tx: mpsc::UnboundedSender<A::Cmd>,
     pub(crate) state_rx: watch::Receiver<A::State>,
     pub(crate) event_tx: broadcast::Sender<A::Event>,
     pub(crate) progress_rx: watch::Receiver<A::Progress>,
     cancel: CancelToken,
-    waker: SharedWaker,
+    pub(crate) waker: SharedWaker,
+    alive: Arc<AtomicBool>,
 }
 
 impl<A: ActorCore> ActorHandle<A> {
@@ -247,9 +250,8 @@ impl<A: ActorCore> ActorHandle<A> {
     pub fn stop(&self) {
         self.cancel.cancel();
     }
-    /// 主动唤醒 actor 线程（异步壳上是 no-op）。
-    pub fn wake(&self) {
-        self.waker.wake();
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 impl<A: ActorCore> Clone for ActorHandle<A> {
@@ -261,6 +263,7 @@ impl<A: ActorCore> Clone for ActorHandle<A> {
             progress_rx: self.progress_rx.clone(),
             cancel: self.cancel.clone(),
             waker: self.waker.clone(),
+            alive: self.alive.clone(),
         }
     }
 }
@@ -278,17 +281,20 @@ impl<A: ActorCore> Clone for ActorHandle<A> {
 /// # 收命令
 ///
 /// - [`check_cmd`](ActorContext::check_cmd)：非阻塞 `try_recv`，适合"每轮循环顺带看一眼"；
-/// - [`wait_for_cmd`](ActorContext::wait_for_cmd)：`recv().await`，适合异步壳。
+/// - [`wait_for_cmd`](ActorContext::wait_for_cmd)：`recv().await`，适合异步壳；
+/// - `recv_cmd_timeout` / `recv_cmd`：**阻塞**版本，只在 [`ThreadActor`](crate::ThreadActor)
+///   的上下文里才有（见 `thread_actor` 模块）。
 ///
 /// 命令通道关闭（所有 [`ActorHandle`] 都 drop 了）后两者分别返回 `None`，
 /// 实现者据此退出循环即可。
 pub struct ActorContext<A: ActorCore> {
-    cmd_rx: mpsc::UnboundedReceiver<A::Cmd>,
+    pub(crate) cmd_rx: mpsc::UnboundedReceiver<A::Cmd>,
     state_tx: watch::Sender<A::State>,
     event_tx: broadcast::Sender<A::Event>,
     progress_tx: watch::Sender<A::Progress>,
-    cancel: CancelToken,
-    waker: SharedWaker,
+    pub(crate) cancel: CancelToken,
+    pub(crate) waker: SharedWaker,
+    _alive: AliveGuard,
 }
 impl<A: ActorCore> ActorContext<A> {
     /// 获取额外的事件发送端。
@@ -337,34 +343,6 @@ impl<A: ActorCore> ActorContext<A> {
     /// actor 是否已被要求停止。
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
-    }
-    /// 阻塞等待下一条命令，最多等 `dur`。会把当前线程 park 住。
-    ///
-    /// 有命令 → `Ok(cmd)`；`dur` 内无命令 → `Err(CmdWait::Timeout)`；
-    /// 已停止/通道关闭 → `Err(CmdWait::Closed)`。会被 `send_cmd`/`stop`/`wake` 提前唤醒。
-    /// 传 `Duration::MAX` 等价于无限等待。
-    pub fn recv_cmd_timeout(&mut self, dur: Duration) -> Result<A::Cmd, CmdWait> {
-        if self.cancel.is_cancelled() {
-            return Err(CmdWait::Closed);
-        }
-        let waker = self.waker.waker();
-        let deadline = Instant::now().checked_add(dur); // Duration::MAX 不溢出
-        match wait::drive_until(self.cmd_rx.recv(), deadline, &waker) {
-            Some(Some(cmd)) => Ok(cmd),
-            Some(None) => Err(CmdWait::Closed),
-            None => Err(CmdWait::Timeout),
-        }
-    }
-    /// 一直阻塞到有命令、或 actor 被停止。
-    pub fn recv_cmd(&mut self) -> Option<A::Cmd> {
-        if self.cancel.is_cancelled() {
-            return None;
-        }
-        let waker = self.waker.waker();
-        match wait::drive_until(self.cmd_rx.recv(), None, &waker) {
-            Some(cmd) => cmd,
-            None => unreachable!("无 deadline 不会超时"),
-        }
     }
 }
 /// 取消信号。
@@ -446,3 +424,9 @@ impl fmt::Display for SendCmdError {
 }
 
 impl std::error::Error for SendCmdError {}
+struct AliveGuard(Arc<AtomicBool>);
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}

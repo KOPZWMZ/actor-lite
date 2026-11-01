@@ -24,23 +24,21 @@ impl ActorCore for Counter {
 }
 
 impl AsyncActor for Counter {
-    fn run(self, mut ctx: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static {
-        async move {
-            let cancel = ctx.cancel_clone();
-            let mut count = self.count;
+    async fn run(self, mut ctx: ActorContext<Self>) {
+        let cancel = ctx.cancel_clone();
+        let mut count = self.count;
 
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    cmd = ctx.wait_for_cmd() => match cmd {
-                        Some(Cmd::Inc) => {
-                            count += 1;
-                            ctx.update_state(count);
-                            ctx.send_event(count);
-                        }
-                        None => break,          // 所有 handle 都没了
-                    },
-                }
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                cmd = ctx.wait_for_cmd() => match cmd {
+                    Some(Cmd::Inc) => {
+                        count += 1;
+                        ctx.update_state(count);
+                        ctx.send_event(count);
+                    }
+                    None => break,          // 所有 handle 都没了
+                },
             }
         }
     }

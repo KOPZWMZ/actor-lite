@@ -10,25 +10,36 @@ use std::thread;
 use std::thread::Thread;
 use std::time::Instant;
 
-/// 用给定 `waker` 轮询 `fut`，直到就绪或到达 `deadline`（`None` = 一直等）。
+/// 两个 future 一起等，谁先就绪返回谁。
+pub(crate) enum Either2<A, B> {
+    First(A),
+    Second(B),
+}
+
+/// 同时驱动 `a` 和 `b`，返回先就绪的那个；`None` = 超时。
 ///
-/// 返回 `None` 表示超时（此时 `fut` 被 drop，**调用方负责确认 future 是 cancel-safe**：
-/// `mpsc::recv` / `watch::changed` / `watch::wait_for` 都是）。
-///
-/// # 注意
-///
-/// 会**阻塞当前线程**（`park`）。只能在线程 actor 里用，不要在 tokio worker 上调用。
-pub(crate) fn drive_until<F: Future>(
-    fut: F,
+/// 先 poll `a` ⇒ 有命令时命令优先于取消。
+/// 两个 future 都要求 cancel-safe（`mpsc::recv` / `watch::wait_for` 满足）。
+pub(crate) fn drive_either<A, B>(
+    a: A,
+    b: B,
     deadline: Option<Instant>,
     waker: &Waker,
-) -> Option<F::Output> {
-    let mut fut = pin!(fut);
+) -> Option<Either2<A::Output, B::Output>>
+where
+    A: Future,
+    B: Future,
+{
+    let mut a = pin!(a);
+    let mut b = pin!(b);
     let mut cx = Context::from_waker(waker);
 
     loop {
-        if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {
-            return Some(v);
+        if let Poll::Ready(v) = a.as_mut().poll(&mut cx) {
+            return Some(Either2::First(v));
+        }
+        if let Poll::Ready(v) = b.as_mut().poll(&mut cx) {
+            return Some(Either2::Second(v));
         }
         match deadline {
             None => thread::park(),
@@ -43,23 +54,23 @@ pub(crate) fn drive_until<F: Future>(
     }
 }
 
-/// 无超时的阻塞等待。
-pub(crate) fn block_on<F: Future>(fut: F, waker: &Waker) -> F::Output {
-    match drive_until(fut, None, waker) {
-        Some(v) => v,
-        None => unreachable!("deadline 为 None 时 drive_until 不会返回 None"),
+/// 单 future 版本：等到就绪或 `deadline`（`None` = 一直等）。`None` = 超时。
+///
+/// 内部复用 [`drive_either`]：第二个 future 用一个永不就绪的 `pending()`，
+/// 于是语义退化成"只等 `fut`"，park 逻辑一行都不用重复。
+pub(crate) fn drive_until<F: Future>(
+    fut: F,
+    deadline: Option<Instant>,
+    waker: &Waker,
+) -> Option<F::Output> {
+    use std::convert::Infallible;
+
+    match drive_either(fut, std::future::pending::<Infallible>(), deadline, waker) {
+        Some(Either2::First(v)) => Some(v),
+        Some(Either2::Second(never)) => match never {}, // Infallible 不可构造
+        None => None,
     }
 }
-/// [`ActorContext::recv_cmd_timeout`] 的等待结果。`Timeout` 不是错误，是正常的空闲 tick。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CmdWait {
-    /// 这段时间内没有命令。
-    Timeout,
-    /// actor 已停止，或命令通道关闭 —— 该退出循环了。
-    Closed,
-}
-
 /// actor 所在线程的唤醒句柄。异步壳没有专属线程 → 全部是 no-op。
 #[derive(Clone, Default, Debug)]
 pub(crate) struct SharedWaker {

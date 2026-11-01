@@ -122,7 +122,7 @@ pub trait AsyncActor: ActorCore + Send + 'static {
     /// ```
     fn run(self, context: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static;
 }
-impl<A: ActorCore> ActorHandle<A> {
+impl<A: AsyncActor> ActorHandle<A> {
     /// 异步监听状态变化。
     ///
     /// 每次状态变化时会调用 `op`，传入最新状态；返回的 [`CancelToken`] 调用

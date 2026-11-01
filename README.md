@@ -23,10 +23,22 @@ actor-lite = "0.1"
 |------|------|
 | [`ActorCore`] | 数据面：4 个关联类型 + `init_state_and_progress` + `channel()`，**不要求 `Send`** |
 | [`AsyncActor`] | 异步壳：`run(self, ctx) -> impl Future + Send`，`spawn()` 即 `tokio::spawn` |
-| [`ActorHandle`] | 控制端：同步发命令、读状态/进度、订阅事件、注册异步监听 |
-| [`ActorContext`] | 后台端：写入接口全是同步的，只有 `wait_for_cmd()` 返回 future |
+| [`ThreadActor`] | 线程壳：`run(self, ctx)`（**阻塞**），`spawn_thread(名字, 工厂)` 起一条独立线程；允许 `!Send` |
+| [`ActorHandle`] | 控制端：同步发命令、读状态/进度、订阅事件、注册异步监听、`is_alive()` |
+| [`ActorContext`] | 后台端：写入接口全是同步的；`wait_for_cmd()`（async）与 `recv_cmd_timeout()`（阻塞，仅线程壳） |
 | [`CancelToken`] | 取消信号，幂等、可 clone 共享 |
-| [`manager`] | 管理一组同类型子 actor，聚合它们的状态/进度/事件 |
+| [`CmdWait`] / [`SendCmdError`] | 等待结果（`Timeout`/`Closed`）与发送失败原因（`Stopped`/`Closed`） |
+| [`manager`] | 管理一组同类型子 actor，聚合它们的状态/进度/事件（仅异步壳） |
+
+两种壳只差两点 —— **`run` 的签名**和**怎么起**，其余（通道、状态、事件、取消、监听语义）完全共用：
+
+| | [`AsyncActor`] | [`ThreadActor`] |
+|---|---|---|
+| `run` 签名 | `-> impl Future + Send` | `fn run(self, ctx)`（阻塞） |
+| 起法 | `spawn()` = `tokio::spawn` | `spawn_thread(名字, 工厂)` = `std::thread` |
+| 需要 runtime | 是 | **否**（只用 `tokio::sync` 的纯数据结构） |
+| 能用 `!Send` 资源 | 否 | **是** |
+| 典型场景 | 网络 / 定时 / IO | GPU 句柄、`Rc<RefCell<_>>`、阻塞式第三方库 |
 
 ## 为什么是两段 impl
 
@@ -156,6 +168,106 @@ handle.stop();
 > （`there is no reactor running`）。同步宿主（GUI 回调、GTK/iOS 主线程等）请改用"拉"的方式：
 > `get_state()` 轮询，或用 `get_events_rx()` 拿 `broadcast::Receiver` 后每帧 `try_recv()`。
 
+## 线程 actor（同步壳）
+
+`!Send` 的资源（GPU 句柄、`Rc<RefCell<_>>` 缓存树、阻塞式播放器/编辑器）装不进异步壳，
+因为它们必须独占一条线程、又不需要 `.await`。这时用 [`ThreadActor`]。
+
+### 1. 实现
+
+```rust
+# use std::rc::Rc;
+# use std::cell::Cell;
+# use std::time::Duration;
+# use actor_lite::{ActorContext, ActorCore, CmdWait, ThreadActor};
+# enum Cmd { Play, Pause }
+# #[derive(Clone)] enum Ev { Started }
+struct Player {
+    // 假设这是某个 !Send 的第三方运行时句柄
+    runtime: Rc<Cell<u32>>,
+}
+
+impl ActorCore for Player {
+    type Cmd = Cmd;
+    type Event = Ev;
+    type State = u32;
+    type Progress = ();
+    fn init_state_and_progress(&self) -> (u32, ()) { (0, ()) }
+}
+
+impl ThreadActor for Player {
+    fn run(mut self, mut ctx: ActorContext<Self>) {
+        loop {
+            match ctx.recv_cmd_timeout(Duration::from_millis(8)) {
+                Ok(Cmd::Play) => { /* 这里可以随便阻塞：open/seek/decode/render */ }
+                Ok(Cmd::Pause) => {}
+                Err(CmdWait::Timeout) => { /* 周期性工作：出帧、上报进度 */ }
+                Err(CmdWait::Closed) => break,   // stop() 或所有 handle 都没了
+                _ => break,                      // CmdWait 是 non_exhaustive
+            }
+            let _ = &mut self.runtime;
+            let _ = &mut ctx;
+        }
+    }
+}
+```
+
+### 2. 启动：传工厂，不是实例
+
+```rust
+# use std::rc::Rc;
+# use std::cell::Cell;
+# use std::time::Duration;
+# use actor_lite::{ActorContext, ActorCore, CmdWait, ThreadActor, spawn_thread};
+# enum Cmd { Play }
+# #[derive(Clone)] enum Ev {}
+# struct Player { runtime: Rc<Cell<u32>> }
+# impl ActorCore for Player {
+#     type Cmd = Cmd; type Event = Ev; type State = u32; type Progress = ();
+#     fn init_state_and_progress(&self) -> (u32, ()) { (0, ()) }
+# }
+# impl ThreadActor for Player {
+#     fn run(self, mut ctx: ActorContext<Self>) {
+#         loop {
+#             match ctx.recv_cmd_timeout(Duration::from_millis(8)) {
+#                 Ok(_) => {}
+#                 Err(CmdWait::Timeout) => {}
+#                 Err(CmdWait::Closed) => break,
+#                 _ => break,
+#             }
+#         }
+#     }
+# }
+// actor 在**新线程内部**构造，所以 !Send 也没关系
+let handle = spawn_thread("player", || Player { runtime: Rc::new(Cell::new(0)) });
+
+handle.send_cmd(Cmd::Play).unwrap();   // 同步、不阻塞、不 panic
+let state = handle.get_state();
+handle.stop();
+```
+
+> 为什么必须传工厂：`std::thread` 的闭包要求 `Send + 'static`，直接搬一个 `!Send` 的 actor 进去会
+> `error[E0277]`。工厂闭包只捕获构造所需的数据（那些必须是 `Send`），actor 本身在线程里出生。
+> 如果你的 actor 本来就是 `Send`（没有 `Rc` 之类），可以直接用方法形式：
+> `actor.spawn_thread("名字")` —— 和异步壳的 `spawn()` 对称。
+
+### 3. 主循环的三种等待形态（按需选）
+
+| 你想怎样 | 写法 | 说明 |
+|---|---|---|
+| 不等待（每轮都有活干） | `ctx.check_cmd()` + 自己的 `sleep` | 忙轮询，空闲时 100% CPU |
+| 等待 + 周期唤醒 | `ctx.recv_cmd_timeout(IDLE)` | 60fps → `IDLE = 8ms`；暂停 → 换成长超时 |
+| 纯阻塞（只等命令/停止） | `ctx.recv_cmd()` | 0 唤醒、~0 CPU，`stop()` 仍能立刻叫醒它 |
+
+`recv_cmd_timeout` 的三条出口正好对应循环里的三件事：`Ok(cmd)` 处理命令、`Err(CmdWait::Timeout)`
+做周期性工作、`Err(CmdWait::Closed)` 退出。注意它是**真睡**（`park`），不是空转；
+有命令时会立刻被唤醒，不会等满 `IDLE`。
+
+### 4. 状态别放进阻塞等待里
+
+「要一帧」这类高频信号**不要**用命令队列排队（延迟会累积），建议用共享标记 + 命令唤醒的组合，
+或者把请求合并：一次 `check_cmd()` 把积压的 `Cmd::RequestFrame` 全部取走，只出一帧。
+
 ## 不用壳，自己驱动
 
 `ActorCore` 不规定 actor 怎么跑。自己调 `channel` 拿两端，把 `ActorContext` 交给任意
@@ -176,6 +288,10 @@ let (ctx, handle) = MyActor::channel((), ());
 # let _ = handle;
 # let _ = ctx;
 ```
+
+注意：`recv_cmd_timeout` / `recv_cmd` 这些**阻塞**方法只挂在 `A: ThreadActor` 的 `ActorContext` 上
+（编译期就限制住了）。自己手动驱动时，只要把循环写成 `impl ThreadActor for MyActor { fn run(...) }`
+就等价于"自定义壳"，那些方法自然可用；否则就用 `check_cmd()` / `wait_for_cmd().await`。
 
 ## 用 manager 管理多个子 actor
 
@@ -223,9 +339,42 @@ while let Ok(event) = events.recv().await {
 # }
 ```
 
+## feature
+
+```toml
+[dependencies]
+actor-lite = "0.1"                     # 默认 = async + manager
+
+# 只用核 + 线程壳（零 tokio runtime）
+actor-lite = { version = "0.1", default-features = false }
+```
+
+| feature | 默认 | 作用 |
+|---|---|---|
+| `async` | ✅ | [`AsyncActor`] + `*_listen_async`，引入 `tokio/{rt,time,macros}` |
+| `manager` | ✅ | [`manager`] 模块（隐含 `async`） |
+
+`default-features = false` 时依赖只剩 `tokio/sync` —— 纯数据结构，编出来的二进制里**没有**
+runtime、没有定时器线程。日志走 `tracing`，不需要额外配置。
+
+## 同步 API 的三条铁律
+
+1. **handle 侧的发送是同步的**：`send_cmd` 不阻塞、不返回 future，唯一失败原因是 actor 已停止
+   （`SendCmdError`）。所以能在 GUI 回调、`Drop`、同步宿主里直接调。
+2. **`blocking` 系列只在裸线程里调**：`recv_cmd_timeout` / `recv_cmd` / `cancelled_blocking` 会
+   `park` 当前线程。在线程 actor 的 `run` 里 ✅；在 tokio worker 上 ❌（会拖死 runtime）。
+3. **只有"要等到有数据"才需要 async**：`recv().await` / `changed().await` / `cancelled().await`。
+   线程壳用 `recv_cmd_timeout` 代替，于是对外 API 可以做到零 async。
+
 ## 状态
 
 早期开发中，API 可能随时变化。
 
-- 0.1.0（未发布）：原 `Actor` 拆为 [`ActorCore`] + [`AsyncActor`]；`send_cmd` 由 async 改为同步；
-  命令通道改为无界；修复 `CancelToken` 的丢唤醒竞态。
+- **0.1.0**：
+  - 拆分：原 `Actor` → [`ActorCore`]（数据面）+ [`AsyncActor`]（异步壳），新增 [`ThreadActor`]（线程壳）；
+  - `send_cmd` 由 `async` 改为同步，新增 [`SendCmdError`]；
+  - 命令通道由有界改为无界（`ActorManager` 少一个 const 参数）；
+  - 新增 `is_alive()`、`recv_cmd_timeout()` / `recv_cmd()`、`CmdWait`、`CancelToken::cancelled_blocking()`；
+  - 修复：`CancelToken` 的丢唤醒竞态；`update_state` / `update_progress` 在没有订阅者时丢值；
+    `stop()` 唤不醒阻塞等待中的线程 actor；
+  - feature：新增 `async` / `manager`，`default-features = false` 即"核 + 线程壳"，零 runtime。
