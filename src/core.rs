@@ -1,6 +1,4 @@
 use core::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::warn;
 
@@ -124,7 +122,7 @@ pub trait ActorCore: Sized {
         let waker = SharedWaker::default();
         let cancel = CancelToken::with_waker(waker.clone());
         let context_cancel = cancel.clone();
-        let alive = Arc::new(AtomicBool::new(true));
+        let (alive_tx, alive_rx) = watch::channel(true);
         let context = ActorContext {
             cmd_rx,
             event_tx: event_tx.clone(),
@@ -132,7 +130,7 @@ pub trait ActorCore: Sized {
             progress_tx,
             cancel: context_cancel,
             waker: waker.clone(),
-            _alive: AliveGuard(alive.clone()),
+            _alive: AliveGuard(alive_tx),
         };
         let handle = ActorHandle {
             cmd_tx,
@@ -141,7 +139,7 @@ pub trait ActorCore: Sized {
             progress_rx,
             cancel,
             waker,
-            alive,
+            alive_rx,
         };
         (context, handle)
     }
@@ -201,7 +199,7 @@ pub struct ActorHandle<A: ActorCore> {
     pub(crate) progress_rx: watch::Receiver<A::Progress>,
     cancel: CancelToken,
     pub(crate) waker: SharedWaker,
-    alive: Arc<AtomicBool>,
+    pub(crate) alive_rx: watch::Receiver<bool>,
 }
 
 impl<A: ActorCore> ActorHandle<A> {
@@ -251,7 +249,18 @@ impl<A: ActorCore> ActorHandle<A> {
         self.cancel.cancel();
     }
     pub fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+        *self.alive_rx.borrow()
+    }
+
+    /// 订阅"存活状态"，actor 结束时变成 `false`。
+    ///
+    /// 用来替代轮询 [`is_alive`](ActorHandle::is_alive)：GUI 每帧
+    /// `has_changed()` 一次即可（`watch` 语义，中间变化可丢，只关心最终值）。
+    ///
+    /// 后台端 drop 后 sender 也随之消失，因此 `changed()` 可能返回 `Err`
+    /// —— 那同样意味着 actor 已经结束，按 `false` 处理即可。
+    pub fn alive_rx(&self) -> watch::Receiver<bool> {
+        self.alive_rx.clone()
     }
 }
 impl<A: ActorCore> Clone for ActorHandle<A> {
@@ -263,7 +272,7 @@ impl<A: ActorCore> Clone for ActorHandle<A> {
             progress_rx: self.progress_rx.clone(),
             cancel: self.cancel.clone(),
             waker: self.waker.clone(),
-            alive: self.alive.clone(),
+            alive_rx: self.alive_rx.clone(),
         }
     }
 }
@@ -424,9 +433,10 @@ impl fmt::Display for SendCmdError {
 }
 
 impl std::error::Error for SendCmdError {}
-struct AliveGuard(Arc<AtomicBool>);
+/// ctx 被 drop（正常返回或 unwind）时把存活状态置 false。
+struct AliveGuard(watch::Sender<bool>);
 impl Drop for AliveGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.send_replace(false);
     }
 }

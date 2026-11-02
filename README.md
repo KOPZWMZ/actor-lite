@@ -251,6 +251,74 @@ handle.stop();
 > 如果你的 actor 本来就是 `Send`（没有 `Rc` 之类），可以直接用方法形式：
 > `actor.spawn_thread("名字")` —— 和异步壳的 `spawn()` 对称。
 
+### 3. 启动失败怎么处理（GUI 必读）
+
+`spawn_thread` 在启动失败时 panic（`expect`）。GUI / 服务器这类"不能让一个 actor 起不来就
+拖垮整个程序"的场景用 `try_spawn_thread`：
+
+```rust
+# use std::time::Duration;
+# use actor_lite::{ActorContext, ActorCore, CmdWait, SpawnError, ThreadActor, try_spawn_thread};
+# enum Cmd {}
+# #[derive(Clone)] enum Ev {}
+# struct Player;
+# impl ActorCore for Player {
+#     type Cmd = Cmd; type Event = Ev; type State = u32; type Progress = ();
+#     fn init_state_and_progress(&self) -> (u32, ()) { (0, ()) }
+# }
+# impl ThreadActor for Player {
+#     fn run(self, mut ctx: ActorContext<Self>) {
+#         loop {
+#             match ctx.recv_cmd_timeout(Duration::from_millis(8)) {
+#                 Ok(_) => {}
+#                 Err(CmdWait::Timeout) => {}
+#                 Err(CmdWait::Closed) => break,
+#                 _ => break,
+#             }
+#         }
+#     }
+# }
+match try_spawn_thread("player", || Player) {
+    Ok(handle) => { /* 正常：把 handle 交给 UI */ }
+    Err(e @ SpawnError::ConstructorPanicked(_)) | Err(e @ SpawnError::StartupTimeout(_)) => {
+        // 多半是环境问题（文件打不开 / 驱动不兼容 / 设备被占用）→ 值得展示给用户
+        eprintln!("启动失败，请在界面上提示：{e}");
+    }
+    Err(SpawnError::Thread(io)) => {
+        // 系统级失败（线程数耗尽等）→ 记日志、降级即可
+        eprintln!("无法创建线程：{io}");
+    }
+    Err(_) => {} // SpawnError 是 non_exhaustive
+}
+```
+
+失败分类与处置：
+
+| 变体 | 常见原因 | 给用户看？ |
+|---|---|---|
+| `SpawnError::ConstructorPanicked(msg)` | 构造函数 / `init_state_and_progress` panic：文件打不开、解码器缺失、驱动不兼容、设备被占用 | ✅ 展示 + 重试按钮 |
+| `SpawnError::StartupTimeout(d)` | 初始化卡住（超过 `STARTUP_TIMEOUT`，默认 5s） | ✅ 提示"启动超时" |
+| `SpawnError::Thread(io)` | 线程建不出来（资源耗尽） | ❌ 记日志 + 降级 |
+
+**运行中**崩溃（`run` panic）不会被传播：只记 `error!` 日志，`is_alive()` 变 `false`、
+`send_cmd` 返回 `Err`。UI 想感知它就用订阅，而不是轮询：
+
+```rust
+# use actor_lite::{ActorContext, ActorCore, CmdWait, ThreadActor, spawn_thread};
+# struct W;
+# impl ActorCore for W { type Cmd = (); type Event = (); type State = (); type Progress = ();
+#     fn init_state_and_progress(&self) -> ((), ()) { ((), ()) } }
+# impl ThreadActor for W { fn run(self, _ctx: ActorContext<Self>) {} }
+let handle = spawn_thread("w", || W);
+let mut alive = handle.alive_rx();          // watch::Receiver<bool>
+// GUI 每帧：if *alive.borrow_and_update() == false { 切到"已停止" }
+# let _ = &mut alive;
+```
+
+> 注意线程 actor 最怕的不是 panic（可观测、已隔离），而是**卡死**：阻塞调用永不返回时
+> `is_alive()` 仍是 `true`。这类问题只能靠上层心跳（actor 每次 tick 更新 progress，
+> UI 检测"多久没动"）和命令超时（发 `Ping`、等不到 `Pong` 就重建）来兜。
+
 ### 3. 主循环的三种等待形态（按需选）
 
 | 你想怎样 | 写法 | 说明 |

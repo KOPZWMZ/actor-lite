@@ -5,7 +5,10 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use actor_lite::{ActorContext, ActorCore, ActorHandle, CmdWait, ThreadActor, spawn_thread};
+use actor_lite::{
+    ActorContext, ActorCore, ActorHandle, CmdWait, SpawnError, ThreadActor, spawn_thread,
+    try_spawn_thread,
+};
 
 #[derive(Debug)]
 enum Cmd {
@@ -203,4 +206,97 @@ fn send_actor_can_use_method_form() {
 
     handle.stop();
     wait_until(|| !handle.is_alive(), Duration::from_secs(1));
+}
+
+/// `alive_rx()`：actor 结束（stop / panic）后订阅端能观察到 `false`。
+#[test]
+fn alive_rx_observes_exit() {
+    let (_rx, h) = spawn(Duration::MAX, "t-alive");
+    let mut alive = h.alive_rx();
+    assert!(*alive.borrow_and_update());
+
+    h.stop();
+    wait_until(|| !*alive.borrow_and_update(), Duration::from_secs(1));
+}
+
+/// 工厂闭包 panic → `SpawnError::ConstructorPanicked`，带 panic 消息，且**不**炸进程。
+#[test]
+fn factory_panic_is_reported() {
+    let err = match try_spawn_thread::<NeverBuilt, _>("t-factory", || { panic!("打不开文件") }) {
+        Ok(_) => panic!("构造 panic 时不该启动成功"),
+        Err(e) => e,
+    };
+    match err {
+        SpawnError::ConstructorPanicked(msg) => {
+            assert!(msg.contains("打不开文件"), "panic 消息没传出来: {msg}");
+        }
+        other => panic!("期望 ConstructorPanicked，实际 {other:?}"),
+    }
+}
+
+/// `init_state_and_progress` panic → 同样归类为 `ConstructorPanicked`。
+#[test]
+fn init_panic_is_reported() {
+    let err = match try_spawn_thread::<BadInit, _>("t-badinit", || BadInit) {
+        Ok(_) => panic!("初始化 panic 时不该启动成功"),
+        Err(e) => e,
+    };
+    match err {
+        SpawnError::ConstructorPanicked(msg) => {
+            assert!(msg.contains("初始化失败"), "panic 消息没传出来: {msg}");
+        }
+        other => panic!("期望 ConstructorPanicked，实际 {other:?}"),
+    }
+}
+
+/// 成功路径上 `try_spawn_thread` 也能用。
+#[test]
+fn try_spawn_thread_success() {
+    let (tx, rx) = mpsc::channel();
+    let h = try_spawn_thread("t-try-ok", move || RcCounter {
+        hits: Rc::new(Cell::new(0)),
+        tx,
+        idle: Duration::from_millis(10),
+    })
+    .expect("应该能启动");
+
+    h.send_cmd(Cmd::Inc).unwrap();
+    assert_eq!(rx.recv_timeout(Duration::from_secs(1)).unwrap(), Ev::Count(1));
+    h.stop();
+}
+
+// ---- 用于失败路径的最小 actor ----
+
+struct NeverBuilt;
+
+impl ActorCore for NeverBuilt {
+    type Cmd = ();
+    type Event = ();
+    type State = ();
+    type Progress = ();
+
+    fn init_state_and_progress(&self) -> (Self::State, Self::Progress) {
+        ((), ())
+    }
+}
+
+impl ThreadActor for NeverBuilt {
+    fn run(self, _ctx: ActorContext<Self>) {}
+}
+
+struct BadInit;
+
+impl ActorCore for BadInit {
+    type Cmd = ();
+    type Event = ();
+    type State = ();
+    type Progress = ();
+
+    fn init_state_and_progress(&self) -> (Self::State, Self::Progress) {
+        panic!("初始化失败: 设备被占用")
+    }
+}
+
+impl ThreadActor for BadInit {
+    fn run(self, _ctx: ActorContext<Self>) {}
 }

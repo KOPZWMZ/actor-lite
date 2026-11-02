@@ -7,7 +7,7 @@
 
 ## [Unreleased]
 
-## [0.1.0] - 2026-11-01
+## [0.1.0] - 2026-11-02
 
 ### Breaking
 
@@ -24,6 +24,11 @@
   自由函数 `spawn_thread(名字, 工厂)`（**唯一**能给 `!Send` 用的形式，actor 在新线程内部构造），
   以及 `Send` 的 actor 可用的方法形式 `ThreadActor::spawn_thread(self, 名字)`。
   两种都不需要 tokio runtime。
+- `try_spawn_thread()` + `SpawnError`（`Thread` / `ConstructorPanicked(msg)` / `StartupTimeout`）
+  与 `STARTUP_TIMEOUT`：启动失败不再只有 panic 一条路，GUI 可以优雅降级。
+- `ActorHandle::alive_rx()`：`watch::Receiver<bool>` 形式的存活订阅，替代轮询 `is_alive()`；
+  `is_alive()` 内部同步改为 `watch` 通道实现。
+- `run` panic 时把 panic 消息记进日志（`catch_unwind` 的 payload 会被取出解析）。
 - `ActorContext::recv_cmd_timeout()` / `recv_cmd()`：同步阻塞等待命令，带超时与取消；
   `CmdWait`（`Timeout` / `Closed`）表示三种出口。
 - `ActorHandle::is_alive()`：`run` 返回或 panic 之后变 `false`。

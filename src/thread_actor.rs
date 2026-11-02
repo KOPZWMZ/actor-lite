@@ -89,30 +89,110 @@ pub trait ThreadActor: ActorCore {
 ///
 /// # Panic
 ///
-/// - `factory` / `init_state_and_progress` panic → 本函数 panic（信息里会说明是启动失败）；
-/// - `run` panic → 被 `catch_unwind` 兜住，只记一条 error 日志，之后
-///   [`ActorHandle::is_alive`] 变 `false`、`send_cmd` 返回 `Err`。
+/// 启动失败会 panic（`expect`），需要优雅处理请改用 [`try_spawn_thread`]。
+/// `run` 里的 panic **不会**传播：被 `catch_unwind` 兜住，只记一条 error 日志，
+/// 之后 [`ActorHandle::is_alive`] 变 `false`、`send_cmd` 返回 `Err`。
 pub fn spawn_thread<A, F>(name: &str, factory: F) -> ActorHandle<A>
 where
     A: ThreadActor + 'static,
     F: FnOnce() -> A + Send + 'static,
 {
-    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
-    // 闭包要求 'static：先把 name 的所有权拿过来，闭包里就不许再借用它
+    try_spawn_thread(name, factory).expect("failed to start thread actor")
+}
+
+/// 启动时最多等多久让 actor 交出 handle。超过就判定"构造阶段卡住了"。
+pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 线程 actor 启动失败的原因。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SpawnError {
+    /// `std::thread` 建不出来（线程数耗尽、资源不足、名字不合法）。
+    Thread(std::io::Error),
+    /// 构造函数或 `init_state_and_progress` panic 了（含 panic 消息）。
+    ConstructorPanicked(String),
+    /// 构造阶段超过 [`STARTUP_TIMEOUT`] 还没交出 handle（初始化卡住了）。
+    StartupTimeout(Duration),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Thread(e) => write!(f, "failed to spawn actor thread: {e}"),
+            Self::ConstructorPanicked(msg) => write!(f, "actor failed to start: {msg}"),
+            Self::StartupTimeout(d) => {
+                write!(f, "actor did not hand over its handle within {d:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Thread(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// 在一条新线程上启动 actor，失败时返回 [`SpawnError`] 而不是 panic。
+///
+/// GUI/服务器这类"不能让一个 actor 起不来就拖垮整个程序"的场景用这个，
+/// 其余情况用 [`spawn_thread`] 更省事。
+///
+/// # 为什么是工厂而不是实例
+///
+/// `!Send` 的 actor 无法被搬进 `std::thread` 的闭包（`error[E0277]`），所以 actor 必须
+/// 在新线程内部**构造**。传给闭包的只有构造它所需的数据，那些必须是 `Send`。
+///
+/// # 错误分类
+///
+/// - [`SpawnError::ConstructorPanicked`]：构造函数或初始化 panic（多为环境问题：
+///   文件打不开、驱动不兼容、设备被占用）—— **值得展示给用户**；
+/// - [`SpawnError::StartupTimeout`]：初始化卡住；
+/// - [`SpawnError::Thread`]：系统级失败，通常只记日志。
+pub fn try_spawn_thread<A, F>(name: &str, factory: F) -> Result<ActorHandle<A>, SpawnError>
+where
+    A: ThreadActor + 'static,
+    F: FnOnce() -> A + Send + 'static,
+{
     let thread_name = name.to_owned();
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel::<Result<ActorHandle<A>, SpawnError>>();
 
     std::thread::Builder::new()
         .name(thread_name.clone())
         .spawn(move || {
-            let actor = factory();
-            let (init_state, init_progress) = actor.init_state_and_progress();
+            // ① 构造：把 panic 变成可回传的错误，而不是让线程静默死掉
+            let actor = match std::panic::catch_unwind(AssertUnwindSafe(factory)) {
+                Ok(actor) => actor,
+                Err(payload) => {
+                    let _ = handle_tx.send(Err(SpawnError::ConstructorPanicked(panic_message(
+                        &*payload,
+                    ))));
+                    return;
+                }
+            };
+
+            let (init_state, init_progress) = match std::panic::catch_unwind(AssertUnwindSafe(
+                || actor.init_state_and_progress(),
+            )) {
+                Ok(v) => v,
+                Err(payload) => {
+                    let _ = handle_tx.send(Err(SpawnError::ConstructorPanicked(panic_message(
+                        &*payload,
+                    ))));
+                    return;
+                }
+            };
+
             let (ctx, handle) = A::channel(init_state, init_progress);
 
             // 点亮 waker：之后 send_cmd / stop 就能 unpark 这条线程
             handle.attach_current_thread();
 
-            if handle_tx.send(handle).is_err() {
-                return; // 调用方已经不等了
+            if handle_tx.send(Ok(handle)).is_err() {
+                return; // 调用方已经放弃等待
             }
 
             trace!(
@@ -121,15 +201,36 @@ where
                 "thread actor started"
             );
 
-            if std::panic::catch_unwind(AssertUnwindSafe(|| actor.run(ctx))).is_err() {
-                error!(actor = std::any::type_name::<A>(), "thread actor panicked");
+            // ② 运行：panic 也不能拖垮进程
+            if let Err(payload) = std::panic::catch_unwind(AssertUnwindSafe(|| actor.run(ctx))) {
+                error!(
+                    actor = std::any::type_name::<A>(),
+                    panic = %panic_message(&*payload),
+                    "thread actor panicked"
+                );
             }
         })
-        .expect("failed to spawn actor thread");
+        .map_err(SpawnError::Thread)?;
 
-    handle_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("actor thread failed to start (factory 或 init_state_and_progress panic 了?)")
+    match handle_rx.recv_timeout(STARTUP_TIMEOUT) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(SpawnError::StartupTimeout(STARTUP_TIMEOUT))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(
+            // 线程在交出 handle 之前就死了（上面两条 catch_unwind 之外的路径）
+            SpawnError::ConstructorPanicked("actor thread died during startup".to_owned()),
+        ),
+    }
+}
+
+/// 从 `catch_unwind` 的 payload 里取出可读信息。
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_owned())
 }
 
 /// [`ActorContext::recv_cmd_timeout`](crate::thread_actor::ActorContext::recv_cmd_timeout) 的等待结果。

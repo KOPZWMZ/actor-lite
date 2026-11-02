@@ -15,4 +15,7 @@ mod wait;
 pub use async_actor::AsyncActor;
 
 pub use core::{ActorContext, ActorCore, ActorHandle, CancelToken, SendCmdError};
-pub use thread_actor::{CmdWait, ThreadActor, spawn_thread};
+pub use thread_actor::{
+    CmdWait, STARTUP_TIMEOUT, SpawnError, ThreadActor, spawn_thread, try_spawn_thread,
+};
+pub use tokio::sync::{broadcast, mpsc, watch};
