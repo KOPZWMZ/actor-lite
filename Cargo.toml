@@ -1,6 +1,6 @@
 [package]
 name = "actor-lite"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "基于 tokio 的轻量 actor 抽象：一份核（命令通道 + 状态/进度 + 事件 + 取消）+ 异步壳（tokio::spawn）与线程壳（独占线程，可装 !Send 资源）"

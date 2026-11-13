@@ -7,6 +7,36 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-14
+
+### Fixed
+
+- **`is_alive()` / `alive_rx()` 的语义修正（线程壳）**：存活状态现在在 **actor 的资源完全析构之后**
+  才变 `false`，而不是 `run()` 一返回就变。
+  - **旧行为**：`AliveGuard` 挂在 `ActorContext` 上，`run(self, ctx)` 一返回 ctx 就被 drop →
+    立刻发送 `false`；而 actor 自身的字段（`presenter`、Vulkan 设备、解码器、字体库……）
+    要等闭包结束、`actor` 被 drop 时才释放。于是"看到 `is_alive() == false`"和
+    "后台线程真的退干净"之间存在几十～几百毫秒的窗口。
+  - **后果**：调用方据此认为"可以安全退出了"，进程 `exit()` 与后台线程的 `free()` 赛跑，
+    偶发 glibc 堆损坏（`corrupted double-linked list` / `corrupted size vs. prev_size`）→ `SIGABRT`。
+    典型触发场景：短时间内反复创建/销毁 actor 后立即退出（测试、命令行工具、播放器切换片源）。
+  - **现在**：守卫由线程闭包持有（内部新增 `ActorContext::take_alive_guard()`），
+    在 `actor.run(ctx)` 消费掉 actor、其字段析构之后**最后**才 drop。
+    `is_alive() == false` 从此表示"线程已结束且资源已释放"，可用于判断能否退出进程。
+- **新增回归测试** `tests/is_alive_semantics.rs`：在 actor 的 `Drop` 里故意停留 200ms，
+  把"`is_alive()` 已变 `false` 但资源未释放"的窗口从几毫秒放大到 200ms，
+  于是断言可以**确定性**地检查"观测到 `false` 的那一刻，析构必须已经做完"。
+  - 覆盖两条真实退出路径：`stop()` + 轮询 `is_alive()`，以及 **drop 掉最后一个 handle** +
+    通过 `alive_rx()` 观测（GUI / 播放器句柄的真实退出路径）。
+  - 已验证：把守卫放回 `ActorContext`（模拟 0.1.0）时两条用例**必红**（0.00s，非偶发）；
+    修复后全绿。这个 bug 从此不会再无声无息地回归。
+- 异步壳（`AsyncActor`）不受影响：actor 与 `ctx` 都在 future 内部，完成时一并析构，语义本来就正确。
+
+### Changed
+
+- `is_alive()` / `alive_rx()` 的**文档**明确写出 `false` 的准确含义（资源已释放，不只是 `run` 返回），
+  并说明反方向不成立：`true` 不代表 actor 干得动活（阻塞卡死时仍是 `true`）。
+
 ## [0.1.0] - 2026-11-02
 
 ### Breaking

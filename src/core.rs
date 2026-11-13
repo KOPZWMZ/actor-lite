@@ -130,7 +130,7 @@ pub trait ActorCore: Sized {
             progress_tx,
             cancel: context_cancel,
             waker: waker.clone(),
-            _alive: AliveGuard(alive_tx),
+            _alive: Some(AliveGuard(alive_tx)),
         };
         let handle = ActorHandle {
             cmd_tx,
@@ -248,11 +248,29 @@ impl<A: ActorCore> ActorHandle<A> {
     pub fn stop(&self) {
         self.cancel.cancel();
     }
+    /// actor 是否还活着。
+    ///
+    /// # `false` 的准确含义（0.1.1 起）
+    ///
+    /// **actor 已结束，并且它持有的资源已经析构完。**
+    ///
+    /// 线程壳下，`run(self, ctx)` 返回后 actor 自身还要 drop —— Vulkan 设备、解码器、
+    /// 字体库这类"释放起来要几十毫秒"的东西。本标志在**那之后**才变 `false`，
+    /// 因此用它判断"可以安全退出进程 / 可以安全复用这块资源"是成立的。
+    ///
+    /// 0.1.0 里它只表示"`run` 已返回"，比资源释放早一个窗口：依赖它做退出判断的调用方
+    /// 会与后台线程的 `free()` 赛跑，偶发 glibc 堆损坏（`corrupted double-linked list` /
+    /// `corrupted size vs. prev_size`）→ SIGABRT。详见 CHANGELOG 的 0.1.1。
+    ///
+    /// 反方向不成立：`true` 不代表 actor 干得动活 —— 阻塞调用卡死时它仍然是 `true`。
     pub fn is_alive(&self) -> bool {
         *self.alive_rx.borrow()
     }
 
     /// 订阅"存活状态"，actor 结束时变成 `false`。
+    ///
+    /// `false` 的含义与 [`is_alive`](ActorHandle::is_alive) 相同：**资源已释放完**，
+    /// 不只是 `run` 返回。
     ///
     /// 用来替代轮询 [`is_alive`](ActorHandle::is_alive)：GUI 每帧
     /// `has_changed()` 一次即可（`watch` 语义，中间变化可丢，只关心最终值）。
@@ -303,7 +321,7 @@ pub struct ActorContext<A: ActorCore> {
     progress_tx: watch::Sender<A::Progress>,
     pub(crate) cancel: CancelToken,
     pub(crate) waker: SharedWaker,
-    _alive: AliveGuard,
+    pub(crate) _alive: Option<AliveGuard>,
 }
 impl<A: ActorCore> ActorContext<A> {
     /// 获取额外的事件发送端。
@@ -433,8 +451,16 @@ impl fmt::Display for SendCmdError {
 }
 
 impl std::error::Error for SendCmdError {}
-/// ctx 被 drop（正常返回或 unwind）时把存活状态置 false。
-struct AliveGuard(watch::Sender<bool>);
+/// 把存活状态置 `false` 的守卫。
+///
+/// **谁持有它，决定了 `is_alive()` 的语义**，所以不要随手塞回 [`ActorContext`]：
+/// 线程壳用 [`ActorContext::take_alive_guard`] 把它取出来，由线程闭包持有，
+/// 在 `actor.run(ctx)` 消费掉 actor、其字段析构完之后**最后**才 drop ——
+/// 这样 `is_alive() == false` 才等于"线程已结束且资源已释放"。
+///
+/// 若留在 [`ActorContext`] 里，它会在 `run(self, ctx)` 返回时就 drop，
+/// 比 actor 字段的析构早一个窗口（0.1.0 的 bug，见 CHANGELOG）。
+pub(crate) struct AliveGuard(watch::Sender<bool>);
 impl Drop for AliveGuard {
     fn drop(&mut self) {
         self.0.send_replace(false);

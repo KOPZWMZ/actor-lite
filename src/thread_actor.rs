@@ -8,7 +8,7 @@ use std::{panic::AssertUnwindSafe, time::Instant};
 
 use tracing::{error, trace};
 
-use crate::core::{ActorContext, ActorCore, ActorHandle};
+use crate::core::{ActorContext, ActorCore, ActorHandle, AliveGuard};
 use crate::wait;
 /// actor 的**线程壳**。允许 `!Send` 的资源（GPU 句柄、`Rc<RefCell<_>>`、阻塞式第三方库）。
 ///
@@ -92,6 +92,8 @@ pub trait ThreadActor: ActorCore {
 /// 启动失败会 panic（`expect`），需要优雅处理请改用 [`try_spawn_thread`]。
 /// `run` 里的 panic **不会**传播：被 `catch_unwind` 兜住，只记一条 error 日志，
 /// 之后 [`ActorHandle::is_alive`] 变 `false`、`send_cmd` 返回 `Err`。
+/// 这里的 `false` 表示**actor 字段也已经析构完**（panic 展开同样会 drop actor），
+/// 所以拿到 `false` 就可以安全退出进程或重建。
 pub fn spawn_thread<A, F>(name: &str, factory: F) -> ActorHandle<A>
 where
     A: ThreadActor + 'static,
@@ -186,8 +188,9 @@ where
                 }
             };
 
-            let (ctx, handle) = A::channel(init_state, init_progress);
-
+            let (mut ctx, handle) = A::channel(init_state, init_progress);
+            // ★ 守卫移出 ctx，由闭包持有 —— 它会在闭包最后才 drop
+            let alive = ctx.take_alive_guard();
             // 点亮 waker：之后 send_cmd / stop 就能 unpark 这条线程
             handle.attach_current_thread();
 
@@ -208,7 +211,8 @@ where
                     panic = %panic_message(&*payload),
                     "thread actor panicked"
                 );
-            }
+            };
+            drop(alive);
         })
         .map_err(SpawnError::Thread)?;
 
@@ -281,5 +285,13 @@ impl<A: ThreadActor> ActorContext<A> {
             Err(CmdWait::Closed) => None,
             Err(CmdWait::Timeout) => unreachable!("无限等待不会超时"),
         }
+    }
+    /// 把存活守卫从 ctx 里拿出来，交给线程闭包持有。
+    ///
+    /// 这是 0.1.1 修复的核心：守卫必须在线程闭包的**最后**才 drop ——
+    /// 也就是在 `actor.run(ctx)` 消费掉 actor、其字段（设备 / 解码器 / 字体库）
+    /// 析构完之后。留在 ctx 里会早一个窗口，见 [`AliveGuard`] 的注释。
+    fn take_alive_guard(&mut self) -> Option<AliveGuard> {
+        self._alive.take()
     }
 }
