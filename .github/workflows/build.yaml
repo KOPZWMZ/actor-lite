@@ -1,0 +1,21 @@
+name: 构建测试
+
+on: [push]
+
+env:
+  CARGO_TERM_COLOR: always
+  
+jobs:
+  build:
+    runs-on: self-hosted
+    timeout-minutes: 30 
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: 1 格式检查（不阻断）
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+      - name: 2 编译
+        run: cargo check --all-targets
+      - name: 3 全部测试
+        run: cargo test 
