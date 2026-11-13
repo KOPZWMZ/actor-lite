@@ -14,13 +14,13 @@
 
 ```toml
 [dependencies]
-actor-lite = "0.1"
+actor-lite = "0.1.1"
 ```
 
 ## 组成
 
 | 项 | 说明 |
-|------|------|
+| ------ | ------ |
 | [`ActorCore`] | 数据面：4 个关联类型 + `init_state_and_progress` + `channel()`，**不要求 `Send`** |
 | [`AsyncActor`] | 异步壳：`run(self, ctx) -> impl Future + Send`，`spawn()` 即 `tokio::spawn` |
 | [`ThreadActor`] | 线程壳：`run(self, ctx)`（**阻塞**），`spawn_thread(名字, 工厂)` 起一条独立线程；允许 `!Send` |
@@ -33,7 +33,7 @@ actor-lite = "0.1"
 两种壳只差两点 —— **`run` 的签名**和**怎么起**，其余（通道、状态、事件、取消、监听语义）完全共用：
 
 | | [`AsyncActor`] | [`ThreadActor`] |
-|---|---|---|
+| --- | --- | --- |
 | `run` 签名 | `-> impl Future + Send` | `fn run(self, ctx)`（阻塞） |
 | 起法 | `spawn()` = `tokio::spawn` | `spawn_thread(名字, 工厂)` = `std::thread` |
 | 需要 runtime | 是 | **否**（只用 `tokio::sync` 的纯数据结构） |
@@ -153,7 +153,7 @@ handle.stop();
 ## 命令 / 状态 / 进度 / 事件 的语义
 
 | 用途 | 通道 | 语义 |
-|------|------|------|
+| ------ | ------ | ------ |
 | 命令 | `mpsc`（无界） | 不丢、发送不阻塞、无背压；`send_cmd` 是同步的，唯一失败原因是 actor 已停止 |
 | 状态 | `watch` | 只保留最新值，随时可读；中间值可能被跳过 |
 | 进度 | `watch` | 同上，适合进度条/实时指标；**不要**当消息队列用 |
@@ -295,13 +295,14 @@ match try_spawn_thread("player", || Player) {
 失败分类与处置：
 
 | 变体 | 常见原因 | 给用户看？ |
-|---|---|---|
+| --- | --- | --- |
 | `SpawnError::ConstructorPanicked(msg)` | 构造函数 / `init_state_and_progress` panic：文件打不开、解码器缺失、驱动不兼容、设备被占用 | ✅ 展示 + 重试按钮 |
 | `SpawnError::StartupTimeout(d)` | 初始化卡住（超过 `STARTUP_TIMEOUT`，默认 5s） | ✅ 提示"启动超时" |
 | `SpawnError::Thread(io)` | 线程建不出来（资源耗尽） | ❌ 记日志 + 降级 |
 
 **运行中**崩溃（`run` panic）不会被传播：只记 `error!` 日志，`is_alive()` 变 `false`、
-`send_cmd` 返回 `Err`。UI 想感知它就用订阅，而不是轮询：
+`send_cmd` 返回 `Err`。这里的 `false` 表示 **actor 的资源也已经析构完**（见下方说明），
+所以拿到它就可以安全退出或重建。UI 想感知它就用订阅，而不是轮询：
 
 ```rust
 # use actor_lite::{ActorContext, ActorCore, CmdWait, ThreadActor, spawn_thread};
@@ -315,6 +316,11 @@ let mut alive = handle.alive_rx();          // watch::Receiver<bool>
 # let _ = &mut alive;
 ```
 
+> **`is_alive() == false` 的准确含义（0.1.1 起）**：actor 已结束**且它持有的资源已经释放完**
+> （Vulkan 设备、解码器、字体库……）。所以它可以用来判断"能不能安全退出进程"。
+> 0.1.0 里它只表示"`run` 已返回"，比资源释放早一个窗口 —— 拿它做退出判断会与后台线程的
+> `free()` 赛跑，偶发 `corrupted double-linked list` / `SIGABRT`。细节见 CHANGELOG 0.1.1。
+
 > 注意线程 actor 最怕的不是 panic（可观测、已隔离），而是**卡死**：阻塞调用永不返回时
 > `is_alive()` 仍是 `true`。这类问题只能靠上层心跳（actor 每次 tick 更新 progress，
 > UI 检测"多久没动"）和命令超时（发 `Ping`、等不到 `Pong` 就重建）来兜。
@@ -322,7 +328,7 @@ let mut alive = handle.alive_rx();          // watch::Receiver<bool>
 ### 3. 主循环的三种等待形态（按需选）
 
 | 你想怎样 | 写法 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | 不等待（每轮都有活干） | `ctx.check_cmd()` + 自己的 `sleep` | 忙轮询，空闲时 100% CPU |
 | 等待 + 周期唤醒 | `ctx.recv_cmd_timeout(IDLE)` | 60fps → `IDLE = 8ms`；暂停 → 换成长超时 |
 | 纯阻塞（只等命令/停止） | `ctx.recv_cmd()` | 0 唤醒、~0 CPU，`stop()` 仍能立刻叫醒它 |
@@ -418,7 +424,7 @@ actor-lite = { version = "0.1", default-features = false }
 ```
 
 | feature | 默认 | 作用 |
-|---|---|---|
+| --- | --- | --- |
 | `async` | ✅ | [`AsyncActor`] + `*_listen_async`，引入 `tokio/{rt,time,macros}` |
 | `manager` | ✅ | [`manager`] 模块（隐含 `async`） |
 
