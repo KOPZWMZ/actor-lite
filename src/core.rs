@@ -163,6 +163,18 @@ pub trait ActorCore: Sized {
 /// [`send_cmd`](ActorHandle::send_cmd) 是**同步**的：不阻塞、不返回 future，唯一的失败原因是
 /// actor 已停止（或所有后台端已退出）。因此可以在 GUI 回调、`Drop`、同步宿主里直接调用。
 ///
+/// # 读状态 / 进度
+///
+/// 两种读法，按需选：
+///
+/// - [`get_state`](ActorHandle::get_state) / [`get_progress`](ActorHandle::get_progress)：
+///   同步取一份最新快照，适合偶尔读一次；
+/// - [`state_rx`](ActorHandle::state_rx) / [`progress_rx`](ActorHandle::progress_rx)：
+///   拿 `watch::Receiver` 自己驱动（每帧 `has_changed()`，或 `changed().await`），适合接 GUI 帧循环。
+///
+/// 两者都不需要 runtime；需要回调式的（`op(value).await`）才用 `*_listen_async`，
+/// 那个内部 `tokio::spawn`，要求调用线程有 tokio runtime。
+///
 /// # 示例
 ///
 /// ```no_run
@@ -219,15 +231,20 @@ impl<A: ActorCore> ActorHandle<A> {
         self.waker.wake();
         Ok(())
     }
-    /// 获取 actor 的最新状态。
+    /// 获取 actor 的最新状态（同步快照）。
+    ///
+    /// 每次调用都拷贝一份 `watch` 的当前值，不阻塞、不需要 runtime。
+    /// 适合"偶尔读一次"；想"变了就叫我"而不是轮询，用
+    /// [`state_rx`](ActorHandle::state_rx) 拿接收端自己驱动。
     pub fn get_state(&self) -> A::State {
         self.state_rx.borrow().to_owned()
     }
 
-    /// 获取 actor 的最新进度。
+    /// 获取 actor 的最新进度（同步快照）。
     ///
     /// 进度通道是 `watch`：读者只会看到**最新值**，中间值可能被跳过。
     /// 适合进度条、实时指标，不要拿它当消息队列用。
+    /// 想订阅变化而非每次拉快照，用 [`progress_rx`](ActorHandle::progress_rx)。
     pub fn get_progress(&self) -> A::Progress {
         self.progress_rx.borrow().to_owned()
     }
@@ -279,6 +296,115 @@ impl<A: ActorCore> ActorHandle<A> {
     /// —— 那同样意味着 actor 已经结束，按 `false` 处理即可。
     pub fn alive_rx(&self) -> watch::Receiver<bool> {
         self.alive_rx.clone()
+    }
+
+    /// 订阅状态变化，返回一个 `watch::Receiver`。
+    ///
+    /// 与 [`get_state`](ActorHandle::get_state) 是一对：那个每次拉一份最新快照，
+    /// 这个给你一个能"等下一次变化"的接收端。用途是**自己驱动**的更新循环：
+    ///
+    /// - 同步宿主（GUI 帧循环、GTK/iOS 主线程等）：每帧 `has_changed()` 一次；
+    /// - 异步：在 `select!` 里 `rx.changed().await`。本方法只是 `watch` 通道的接收端，
+    ///   **不需要 tokio runtime**，也不会自己 `spawn` 任务。
+    ///
+    /// ```no_run
+    /// # use actor_lite::{ActorCore, ActorHandle};
+    /// # struct MyActor;
+    /// # impl ActorCore for MyActor {
+    /// #     type Cmd = ();
+    /// #     type Event = ();
+    /// #     type State = u32;
+    /// #     type Progress = ();
+    /// #     fn init_state_and_progress(&self) -> (u32, ()) {
+    /// #         (0, ())
+    /// #     }
+    /// # }
+    /// # fn gui_frame(handle: &ActorHandle<MyActor>) {
+    /// let mut states = handle.state_rx();
+    ///
+    /// // 每帧调一次：有变化就取新值重绘（没有就什么也不做）
+    /// if states.has_changed().unwrap_or(false) {
+    ///     let state: u32 = states.borrow_and_update().clone();
+    ///     # let _ = state;
+    ///     // draw(state);
+    /// }
+    /// # }
+    /// ```
+    ///
+    /// # 语义（`watch`）
+    ///
+    /// 只保留**最新值**，中间值可能被跳过：actor 连续更新多次而读者没跟上，只看到最后那次。
+    /// 要一条不漏地收消息，请用 [`get_events_rx`](ActorHandle::get_events_rx)（`broadcast`），
+    /// 别把状态当事件流用。
+    ///
+    /// # 第一次 `changed()` 可能立刻返回
+    ///
+    /// 每次调用都 clone 出一个**独立**的接收端（各自维护"已读"位置，多个读者互不影响），
+    /// 而 clone 带过来的是 handle 内部的已读位置。因此如果 actor 在
+    /// [`channel`](ActorCore::channel) 之后已经更新过状态，新接收端的 `has_changed()` /
+    /// `changed()` 会**立刻**就绪 —— 那读到的是**当前值**，不是"刚刚又变了一次"。
+    ///
+    /// 所以正确顺序是：先用 `borrow()` / `borrow_and_update()` 取初始值，再等 `changed()`
+    /// 拿增量；别把第一次 `changed()` 当成一次独立的变化通知。
+    ///
+    /// # actor 结束后
+    ///
+    /// 后台端 drop 后 sender 随之消失：`changed()` 返回 `Err`，`has_changed()` 返回
+    /// `Err(RecvError)`，此时 `borrow()` 仍能读到**最后一个值**。
+    /// 处理方式与 [`alive_rx`](ActorHandle::alive_rx) 相同 —— `Err` 就是"actor 已经结束"，
+    /// 不必当成致命错误。
+    ///
+    /// # 与 `state_listen_async` 的区别
+    ///
+    /// `state_listen_async` 是回调式（每次变化 `op(state).await`），内部 `tokio::spawn`，
+    /// 要求调用线程有 runtime；本方法只交出接收端，由调用方决定在哪读、多久读一次。
+    /// 同步宿主或已经有自己的循环时，用这个更省事，也更好控制背压。
+    pub fn state_rx(&self) -> watch::Receiver<A::State> {
+        self.state_rx.clone()
+    }
+
+    /// 订阅进度变化，返回一个 `watch::Receiver`。
+    ///
+    /// 与 [`get_progress`](ActorHandle::get_progress) 是一对：那个是"现在多少"，这个能
+    /// "等下一次进度变化"。典型用法是进度条 / 实时指标：同步宿主每帧 `has_changed()`
+    /// 后重绘，异步里 `select!` 到 `rx.changed()`。不需要 tokio runtime，也不自己起任务。
+    ///
+    /// # 语义（`watch`，比状态更需要小心）
+    ///
+    /// 进度是**高频、可丢**的：actor 在一帧里推进了 100 次，读者只看到最后那次。
+    /// 这正适合进度条（画面本来就只能显示最新值），但如果你要的是"每个中间值都要处理"
+    /// （逐条日志、逐笔成交），那是 [`get_events_rx`](ActorHandle::get_events_rx) 的场景。
+    ///
+    /// 与 [`state_rx`](ActorHandle::state_rx) 一样，clone 出来的接收端第一次 `changed()`
+    /// 可能立刻就绪（读到的是当前值），所以先 `borrow()` 拿初值再等 `changed()`。
+    /// actor 结束后 `changed()` 返回 `Err`，`borrow()` 仍能读到最后一个进度值。
+    ///
+    /// # 示例
+    ///
+    /// ```no_run
+    /// # use actor_lite::{ActorCore, ActorHandle};
+    /// # struct Player;
+    /// # impl ActorCore for Player {
+    /// #     type Cmd = ();
+    /// #     type Event = ();
+    /// #     type State = ();
+    /// #     type Progress = f32;
+    /// #     fn init_state_and_progress(&self) -> ((), f32) {
+    /// #         ((), 0.0)
+    /// #     }
+    /// # }
+    /// # fn gui_frame(handle: &ActorHandle<Player>) {
+    /// let mut progress = handle.progress_rx();
+    ///
+    /// if progress.has_changed().unwrap_or(false) {
+    ///     let pct: f32 = *progress.borrow_and_update();
+    ///     # let _ = pct;
+    ///     // set_progress_bar(pct);
+    /// }
+    /// # }
+    /// ```
+    pub fn progress_rx(&self) -> watch::Receiver<A::Progress> {
+        self.progress_rx.clone()
     }
 }
 impl<A: ActorCore> Clone for ActorHandle<A> {

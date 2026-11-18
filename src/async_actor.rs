@@ -132,8 +132,9 @@ impl<A: AsyncActor> ActorHandle<A> {
     ///
     /// 内部使用 `tokio::spawn`，**调用线程必须有 tokio runtime**，否则会 panic
     /// （`there is no reactor running`）。同步宿主（GUI 回调、GTK/iOS 主线程等）请改用
-    /// `watch::Receiver` 的方式自己拉：`get_state()` 轮询，或基于
-    /// `get_events_rx()` 每帧 `try_recv()`。
+    /// [`state_rx`](ActorHandle::state_rx) 拿 `watch::Receiver` 自己拉（每帧
+    /// `has_changed()`），或 [`get_state`](ActorHandle::get_state) 轮询，
+    /// 或基于 [`get_events_rx`](ActorHandle::get_events_rx) 每帧 `try_recv()`。
     pub fn state_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
     where
         F: FnMut(A::State) -> Fut + Send + 'static,
@@ -169,6 +170,8 @@ impl<A: AsyncActor> ActorHandle<A> {
     /// # 注意
     ///
     /// 与 [`ActorHandle::state_listen_async`] 相同：内部 `tokio::spawn`，需要 tokio runtime。
+    /// 同步宿主请改用 [`progress_rx`](ActorHandle::progress_rx)（`watch::Receiver`，自己每帧拉）
+    /// 或 [`get_progress`](ActorHandle::get_progress)（取当前快照）。
     pub fn progress_listen_async<F, Fut>(&self, mut op: F) -> CancelToken
     where
         F: FnMut(A::Progress) -> Fut + Send + 'static,

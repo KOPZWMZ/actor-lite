@@ -14,7 +14,7 @@
 
 ```toml
 [dependencies]
-actor-lite = "0.1.1"
+actor-lite = "0.1.2"
 ```
 
 ## 组成
@@ -142,6 +142,12 @@ handle.send_cmd(CounterCmd::Reset).ok();
 let state: u32 = handle.get_state();
 # let _ = state;
 
+// 想"变了就叫我"，而不是每次拉快照：拿 watch::Receiver 自己驱动
+// （state_rx / progress_rx，不需要 tokio runtime，GUI 帧循环里也能用）
+let mut states = handle.state_rx();
+let mut progress = handle.progress_rx();
+# let _ = (&mut states, &mut progress);
+
 // 订阅事件流：拿到的是 broadcast::Receiver，可以自己 recv / try_recv
 let mut events = handle.get_events_rx();
 # let _ = &mut events;
@@ -152,21 +158,79 @@ handle.stop();
 
 ## 命令 / 状态 / 进度 / 事件 的语义
 
-| 用途 | 通道 | 语义 |
-| ------ | ------ | ------ |
-| 命令 | `mpsc`（无界） | 不丢、发送不阻塞、无背压；`send_cmd` 是同步的，唯一失败原因是 actor 已停止 |
-| 状态 | `watch` | 只保留最新值，随时可读；中间值可能被跳过 |
-| 进度 | `watch` | 同上，适合进度条/实时指标；**不要**当消息队列用 |
-| 事件 | `broadcast` | 多订阅者、按容量有界；落后太多会收到 `Lagged`（丢事件，不重放） |
+| 用途 | 通道 | 语义 | 怎么读 / 订阅 |
+| ------ | ------ | ------ | ------ |
+| 命令 | `mpsc`（无界） | 不丢、发送不阻塞、无背压；`send_cmd` 是同步的，唯一失败原因是 actor 已停止 | `send_cmd` |
+| 状态 | `watch` | 只保留最新值，随时可读；中间值可能被跳过 | 快照 `get_state()`；订阅 `state_rx()` |
+| 进度 | `watch` | 同上，适合进度条/实时指标；**不要**当消息队列用 | 快照 `get_progress()`；订阅 `progress_rx()` |
+| 事件 | `broadcast` | 多订阅者、按容量有界；落后太多会收到 `Lagged`（丢事件，不重放） | `get_events_rx()` |
 
 ## 监听
+
+两种风格，按宿主选：
+
+| 风格 | API | 需要 tokio runtime | 适合 |
+| ------ | ------ | ------ | ------ |
+| **拉**（pull） | `state_rx()` / `progress_rx()` / `get_events_rx()` | ❌ | GUI 帧循环、同步宿主、自己的循环 |
+| **推**（回调） | `state_listen_async()` / `progress_listen_async()` / `events_listen_async()` | ✅ 内部 `tokio::spawn` | 已经跑在 tokio 里的后台逻辑 |
+
+### 拉：`state_rx()` / `progress_rx()`
+
+拿到的是 `tokio::sync::watch::Receiver`：`has_changed()` 看有没有变、`borrow()` 取最新值。
+同步宿主每帧调一次即可，**不需要 runtime**，也不会自己起任务：
+
+```no_run
+# use std::future::Future;
+# use actor_lite::{ActorContext, ActorCore, AsyncActor};
+# struct Counter;
+# enum CounterCmd { Reset }
+# impl ActorCore for Counter {
+#     type Cmd = CounterCmd;
+#     type Event = u32;
+#     type State = u32;
+#     type Progress = f32;
+#     fn init_state_and_progress(&self) -> (u32, f32) { (0, 0.0) }
+# }
+# impl AsyncActor for Counter {
+#     fn run(self, mut ctx: ActorContext<Self>) -> impl Future<Output = ()> + Send + 'static { async {} }
+# }
+# async fn example() {
+let handle = Counter.spawn();
+
+let mut states = handle.state_rx();      // watch::Receiver<u32>
+let mut progress = handle.progress_rx(); // watch::Receiver<f32>
+
+// GUI 每帧（同步，不用 await）：
+if states.has_changed().unwrap_or(false) {
+    let state: u32 = states.borrow_and_update().clone();
+    // 重绘
+    # let _ = state;
+}
+if progress.has_changed().unwrap_or(false) {
+    let pct: f32 = *progress.borrow_and_update();
+    // 进度条
+    # let _ = pct;
+}
+# let _ = (&mut states, &mut progress);
+# }
+```
+
+三个必须知道的坑（`state_rx` / `progress_rx` / `alive_rx` 都一样）：
+
+- **只保留最新值**：actor 连推 100 次，读者只看到最后那次，中间值被跳过。要一条不漏地收，用 `get_events_rx()`（`broadcast`）。
+- **`clone` 出来的接收端，第一次 `changed()` 可能立刻返回**：它继承的是 handle 内部的"已读位置"，
+  actor 只要在启动后更新过，第一次拿到的就是**当前值**，不是"刚刚又变了一次"。
+  正确姿势：先 `borrow()` 拿初值，再等 `changed()` 拿增量。
+- **actor 结束后**：`changed()` 返回 `Err`，`borrow()` 仍能读到最后一个值 —— 把 `Err` 当作"结束了"处理，不是故障。
+
+### 推：`*_listen_async`
 
 [`ActorHandle`] 上的 `state_listen_async` / `progress_listen_async` / `events_listen_async`
 返回 [`CancelToken`]：调用 `cancel()` 停止对应的监听任务。
 
 > ⚠️ 这三个方法内部用 `tokio::spawn`，**调用线程必须有 tokio runtime**，否则会 panic
-> （`there is no reactor running`）。同步宿主（GUI 回调、GTK/iOS 主线程等）请改用"拉"的方式：
-> `get_state()` 轮询，或用 `get_events_rx()` 拿 `broadcast::Receiver` 后每帧 `try_recv()`。
+> （`there is no reactor running`）。同步宿主（GUI 回调、GTK/iOS 主线程等）请改用上面"拉"的方式：
+> `state_rx()` / `progress_rx()` 每帧看一次，或用 `get_events_rx()` 拿 `broadcast::Receiver` 后每帧 `try_recv()`。
 
 ## 线程 actor（同步壳）
 
@@ -431,6 +495,9 @@ actor-lite = { version = "0.1", default-features = false }
 `default-features = false` 时依赖只剩 `tokio/sync` —— 纯数据结构，编出来的二进制里**没有**
 runtime、没有定时器线程。日志走 `tracing`，不需要额外配置。
 
+`state_rx()` / `progress_rx()` / `alive_rx()` / `get_events_rx()` 这些"拉"的 API 都在核里，
+**不需要** `async` feature；只有 `*_listen_async` 那组回调式监听才需要。
+
 ## 同步 API 的三条铁律
 
 1. **handle 侧的发送是同步的**：`send_cmd` 不阻塞、不返回 future，唯一失败原因是 actor 已停止
@@ -439,11 +506,18 @@ runtime、没有定时器线程。日志走 `tracing`，不需要额外配置。
    `park` 当前线程。在线程 actor 的 `run` 里 ✅；在 tokio worker 上 ❌（会拖死 runtime）。
 3. **只有"要等到有数据"才需要 async**：`recv().await` / `changed().await` / `cancelled().await`。
    线程壳用 `recv_cmd_timeout` 代替，于是对外 API 可以做到零 async。
+   注意 `state_rx()` / `progress_rx()` 给出的 `changed()` 只是 `watch` 的 future，
+   不需要 tokio runtime（同步宿主可以干脆用 `has_changed()` 每帧查，完全不碰 async）。
 
 ## 状态
 
 早期开发中，API 可能随时变化。
 
+- **0.1.2**：
+  - 新增 `ActorHandle::state_rx()` / `progress_rx()`：把内部 `watch::Receiver` 直接交给调用方，
+    同步宿主可以每帧 `has_changed()` 订阅状态/进度变化，不必轮询 `get_state()` / `get_progress()`，
+    也不受 `*_listen_async` 需要 tokio runtime 的限制；
+  - `get_state()` / `get_progress()` 与 `*_listen_async` 的文档补上"该用哪个"的指引。
 - **0.1.0**：
   - 拆分：原 `Actor` → [`ActorCore`]（数据面）+ [`AsyncActor`]（异步壳），新增 [`ThreadActor`]（线程壳）；
   - `send_cmd` 由 `async` 改为同步，新增 [`SendCmdError`]；

@@ -7,6 +7,28 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-18
+
+### Added
+
+- **`ActorHandle::state_rx()` / `ActorHandle::progress_rx()`**：把内部的状态/进度 `watch::Receiver`
+  直接交给调用方（每次调用 clone 出一个独立接收端）。
+  - 用途：**自己驱动**的更新循环 —— 同步宿主（GUI 帧循环、GTK/iOS 主线程）每帧 `has_changed()`
+    一次，异步里 `select!` 到 `changed()`；不需要 tokio runtime，也不会自己 `spawn` 任务。
+    在此之前只能二选一：`get_state()` 轮询，或 `state_listen_async`（要求调用线程有 runtime）。
+  - `watch` 语义：只保留最新值，中间值可能被跳过；要一条不漏地用 `get_events_rx()`（`broadcast`）。
+  - 需要注意：clone 出来的接收端继承 handle 内部的已读位置，因此 actor 启动后更新过状态时，
+    第一次 `changed()` / `has_changed()` 会**立刻**就绪，读到的是**当前值**而不是"又变了一次的增量"
+    —— 先 `borrow()` 取初值、再等 `changed()`。actor 结束后 `changed()` 返回 `Err`，
+    `borrow()` 仍能读到最后一个值（语义同 `alive_rx()`）。
+  - 新增回归测试 `tests/basic.rs::state_rx_and_progress_rx_pull_latest`，把上面两条语义钉住。
+
+### Changed
+
+- 文档补全（无代码改动）：`get_state` / `get_progress` 说明"快照 vs 订阅"的分工并指向
+  `state_rx()` / `progress_rx()`；`*_listen_async` 的"同步宿主请改用……"提示改为推荐
+  `state_rx()` / `progress_rx()`；README 的「监听」一节拆成"拉 / 推"两种风格并给出 `watch` 的坑。
+
 ## [0.1.1] - 2026-11-14
 
 ### Fixed
